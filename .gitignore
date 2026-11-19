@@ -1,0 +1,14 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local database & environment secrets
+gym.db
+*.db
+.env
+.env.*
