@@ -2,11 +2,15 @@
 Run:  pip install -r requirements.txt   ->   python app.py   ->   open http://127.0.0.1:5000
 Demo accounts: password is "1234" for everyone. aldair@kbtu.kz is admin.
 
-NOTE: the code was generated with AI help. The "DONE BY" tags show which team
-member is RESPONSIBLE for that part (explains it, tests it, answers questions).
-
 TEAM TASKS (from the weekly table)
-  Iskander  : absent (no contribution recorded)
+  Iskander  : DATABASE + ADMIN TOOLS:
+              - schema rules: CHECK constraints, ON DELETE CASCADE, foreign keys ON (SCHEMA)
+              - seed data in SEED_* constants + bigger demo data for the real gym.db (seed_extended)
+              - schema check: python app.py --check, python app.py --reset
+              - admin AUDIT LOG (AuditLog table, append-only) -> page /admin/audit
+              - admin statistics (JOIN + GROUP BY) -> page /stats
+              - club occupancy chart by weekday and hour on the main page (get_club_load)
+              - friendlier look (nav, tables, empty states); 22 tests -> page /tests, group 5
   Aldair    : 20 test functions in the interface            -> page /tests, group 1
   Torezhan  : new user conveniences + test as user, 10 cases -> search, "My bookings",
               "Booked" badge, past badge, upcoming filter; page /tests, group 3
@@ -25,9 +29,11 @@ SPRINT 3 ADDITIONS:
 """
 import math
 import os
+import random  # ADDED (Iskander)
 import re
 import secrets
 import sqlite3
+import sys     # ADDED (Iskander)
 import threading
 from datetime import datetime, timedelta
 from functools import wraps
@@ -35,7 +41,8 @@ from flask import (Flask, abort, g, render_template_string, request, redirect,
                    url_for, flash, session)
 from werkzeug.security import generate_password_hash, check_password_hash
 
-DB = os.environ.get("DATABASE_PATH", "gym.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB = os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "gym.db"))  # CHANGED (Iskander): fixed path next to app.py
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-only-change-me")
 
@@ -55,9 +62,11 @@ CREATE TABLE IF NOT EXISTS Members (
     member_id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE,
-    membership_status TEXT NOT NULL DEFAULT 'active',
+    membership_status TEXT NOT NULL DEFAULT 'active'
+        CHECK (membership_status IN ('active', 'expired')),     -- CHANGED (Iskander)
     password_hash TEXT NOT NULL DEFAULT '',
-    role TEXT NOT NULL DEFAULT 'member',   -- 'member' | 'admin'
+    role TEXT NOT NULL DEFAULT 'member'
+        CHECK (role IN ('member', 'admin')),                    -- CHANGED (Iskander)
     balance REAL NOT NULL DEFAULT 100.0,
     failed_attempts INTEGER NOT NULL DEFAULT 0,
     locked_until TEXT
@@ -66,23 +75,26 @@ CREATE TABLE IF NOT EXISTS Sessions (
     session_id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
     trainer TEXT NOT NULL,
-    session_date TEXT NOT NULL,   -- YYYY-MM-DD
-    start_time TEXT NOT NULL,     -- HH:MM
+    session_date TEXT NOT NULL
+        CHECK (session_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),  -- YYYY-MM-DD (CHANGED, Iskander)
+    start_time TEXT NOT NULL
+        CHECK (start_time GLOB '[0-9][0-9]:[0-9][0-9]'),                         -- HH:MM (CHANGED, Iskander)
     capacity INTEGER NOT NULL CHECK (capacity > 0),
     price REAL NOT NULL DEFAULT 10.0 CHECK (price >= 0)
 );
 CREATE TABLE IF NOT EXISTS Bookings (
     booking_id INTEGER PRIMARY KEY,
-    member_id INTEGER NOT NULL REFERENCES Members(member_id),
-    session_id INTEGER NOT NULL REFERENCES Sessions(session_id),
-    status TEXT NOT NULL DEFAULT 'confirmed',
+    member_id INTEGER NOT NULL REFERENCES Members(member_id) ON DELETE CASCADE,    -- CHANGED (Iskander)
+    session_id INTEGER NOT NULL REFERENCES Sessions(session_id) ON DELETE CASCADE, -- CHANGED (Iskander)
+    status TEXT NOT NULL DEFAULT 'confirmed'
+        CHECK (status IN ('confirmed', 'cancelled')),                              -- CHANGED (Iskander)
     booked_at TEXT NOT NULL,
     UNIQUE (member_id, session_id)
 );
 CREATE TABLE IF NOT EXISTS Payments (
     payment_id INTEGER PRIMARY KEY,
-    member_id INTEGER NOT NULL REFERENCES Members(member_id),
-    session_id INTEGER NOT NULL REFERENCES Sessions(session_id),
+    member_id INTEGER NOT NULL REFERENCES Members(member_id) ON DELETE CASCADE,    -- CHANGED (Iskander)
+    session_id INTEGER NOT NULL,  -- CHANGED (Iskander): no FK on purpose, payment history survives deleting a training
     amount REAL NOT NULL CHECK (amount >= 0),
     status TEXT NOT NULL DEFAULT 'paid' CHECK (status IN ('paid', 'refunded')),
     created_at TEXT NOT NULL,
@@ -90,20 +102,96 @@ CREATE TABLE IF NOT EXISTS Payments (
 );
 CREATE TABLE IF NOT EXISTS PasswordResets (
     token TEXT PRIMARY KEY,
-    member_id INTEGER NOT NULL REFERENCES Members(member_id),
+    member_id INTEGER NOT NULL REFERENCES Members(member_id) ON DELETE CASCADE,    -- CHANGED (Iskander)
     expires_at TEXT NOT NULL,
     used INTEGER NOT NULL DEFAULT 0
 );
+-- ADDED (Iskander): admin audit log. No FK on actor_id: the log must survive deleting a member.
+CREATE TABLE IF NOT EXISTS AuditLog (
+    log_id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    actor_id INTEGER,
+    actor_name TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action LIKE '%.%'),   -- 'kind.what', e.g. session.create
+    target TEXT NOT NULL DEFAULT '',
+    details TEXT NOT NULL DEFAULT ''
+);
+-- the log is append-only: the database itself refuses to change or delete a row
+CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON AuditLog
+BEGIN SELECT RAISE(ABORT, 'AuditLog is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON AuditLog
+BEGIN SELECT RAISE(ABORT, 'AuditLog is append-only'); END;
 """
+
+# ===== ADDED (Iskander): SEED DATA ======================================
+# CORE seed: small and fixed. It is loaded into gym.db AND into every in-memory test database,
+# so the 53 team tests keep working. To plug in the real team data, edit these lists.
+SEED_MEMBERS = [  # (name, email, membership_status, role, balance); password "1234" (DEMO_PW_HASH)
+    ("Aldair", "aldair@kbtu.kz", "active", "admin", 85.0),
+    ("Iskander", "iskander@kbtu.kz", "active", "member", 85.0),
+    ("Adil", "adil@kbtu.kz", "active", "member", 100.0),
+    ("Zhanibek", "zhanibek@kbtu.kz", "active", "member", 100.0),
+    ("Expired Member", "expired@kbtu.kz", "expired", "member", 100.0),
+]
+SEED_SESSIONS = [  # (title, trainer, days_from_today, start_time, capacity, price)
+    ("Yoga", "Aigerim", 1, "10:00", 2, 15.0),
+    ("Boxing", "Daniyar", 2, "18:00", 3, 20.0),
+    ("Fitness", "Madina", 3, "09:00", 4, 12.0),
+    ("Yoga (past)", "Aigerim", -1, "10:00", 5, 15.0),
+]
+SEED_BOOKINGS = [(1, 1), (2, 1)]  # (member_id, session_id): Yoga is full; every booking also gets a paid Payment
+
+# EXTENDED demo data: only for the real gym.db (python app.py), NOT for the tests.
+# A realistic two-week timetable with bigger halls, 30 more members and their bookings,
+# so the occupancy chart looks like a real club and 2 booked places are no longer "100%".
+EXT_MEMBER_NAMES = [
+    "Alua", "Bekzat", "Dana", "Yerlan", "Gulnara", "Timur", "Madi", "Aruzhan", "Nurlan", "Saltanat",
+    "Dias", "Kamila", "Rustem", "Zarina", "Arman", "Ayana", "Miras", "Lyazzat", "Askar", "Dinara",
+    "Olzhas", "Aigul", "Samat", "Nazerke", "Azamat", "Karina", "Ilyas", "Assel", "Ruslan", "Medina",
+]
+EXT_CAPACITY_UPGRADE = {"Yoga": 20, "Boxing": 25, "Fitness": 30, "Yoga (past)": 20}  # the 4 core sessions get real halls
+# (title, trainer, weekdays 0=Mon..6=Sun, start_time, capacity, price, typical fill 0..1)
+EXT_SCHEDULE = [
+    ("Crossfit", "Daniyar", (0, 1, 3, 4), "07:00", 16, 15.0, 0.60),
+    ("Morning Yoga", "Aigerim", (0, 2, 4), "08:00", 20, 12.0, 0.55),
+    ("Weekend Yoga", "Aigerim", (5, 6), "09:00", 25, 12.0, 0.60),
+    ("Stretch & Mobility", "Dana", (1, 3), "09:00", 18, 10.0, 0.50),
+    ("Pilates", "Madina", (1, 3, 5), "10:00", 18, 14.0, 0.55),
+    ("Weekend Fitness", "Madina", (5, 6), "10:00", 30, 12.0, 0.75),
+    ("Core Training", "Sanzhar", (0, 2, 4), "11:00", 18, 13.0, 0.50),
+    ("Weekend HIIT", "Daniyar", (5, 6), "11:00", 25, 13.0, 0.70),
+    ("Lunch HIIT", "Daniyar", (0, 1, 2, 3, 4), "12:00", 20, 13.0, 0.50),
+    ("Family Fitness", "Madina", (5, 6), "12:00", 25, 11.0, 0.55),
+    ("Express Fitness", "Dana", (1, 2, 3), "13:00", 20, 11.0, 0.45),
+    ("Open Boxing", "Daniyar", (5,), "14:00", 20, 15.0, 0.50),
+    ("Strength Basics", "Sanzhar", (0, 2, 4), "15:00", 18, 14.0, 0.45),
+    ("Dance Cardio", "Madina", (5, 6), "15:00", 25, 12.0, 0.50),
+    ("Strength Club", "Sanzhar", (1, 3, 6), "16:00", 18, 14.0, 0.55),
+    ("Weekend Spinning", "Dana", (5, 6), "16:00", 25, 14.0, 0.60),
+    ("Teen Fitness", "Madina", (0, 1, 2, 3, 4), "17:00", 20, 10.0, 0.60),
+    ("Spinning", "Dana", (0, 1, 2, 3, 4), "18:00", 25, 14.0, 0.85),
+    ("Evening Crossfit", "Sanzhar", (0, 2, 4), "18:00", 18, 15.0, 0.80),
+    ("Boxing Group", "Daniyar", (0, 2, 4), "19:00", 25, 20.0, 0.85),
+    ("Zumba", "Madina", (1, 3), "19:00", 30, 14.0, 0.90),
+    ("Functional Training", "Sanzhar", (0, 1, 2, 3, 4), "19:00", 22, 16.0, 0.80),
+    ("Evening Yoga", "Aigerim", (0, 1, 2, 3, 6), "20:00", 25, 12.0, 0.65),
+    ("Late HIIT", "Daniyar", (1, 3, 4), "20:00", 20, 13.0, 0.70),
+    ("Weekend Zumba", "Madina", (5, 6), "18:00", 30, 14.0, 0.70),
+    ("Weekend Boxing", "Daniyar", (5, 6), "19:00", 20, 18.0, 0.70),
+    ("Stretching", "Aigerim", (0, 1, 2, 3, 4, 5), "21:00", 20, 10.0, 0.35),
+]
+EXT_DAYS_BACK, EXT_DAYS_AHEAD = 10, 3  # 14 days: every weekday appears twice; the page lists the next 4 days
+EXT_START_BALANCE = 800.0  # money of every demo member before the demo bookings are paid
 
 
 # =====================================================================
-# DATABASE HELPERS (base app, AI-generated; Iskander's real DB/seed goes here - absent)
+# DATABASE HELPERS (base app; DONE BY: Iskander - SEED_* data, foreign keys, extended demo data, schema check)
 # =====================================================================
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")  # ADDED (Iskander)
     return g.db
 
 
@@ -119,9 +207,10 @@ def day(n):
     return (datetime.now().date() + timedelta(days=n)).isoformat()
 
 
-def seed_db(db):
+def seed_db(db, extended=False):
     """Create tables, apply idempotent migrations, and seed demo data (only if empty).
     Works for gym.db and for the in-memory databases used by the tests."""
+    db.execute("PRAGMA foreign_keys = ON")  # ADDED (Iskander): also for the in-memory test databases
     db.executescript(SCHEMA)
 
     # Idempotent migrations for older gym.db files
@@ -142,31 +231,24 @@ def seed_db(db):
         db.execute("ALTER TABLE Sessions ADD COLUMN price REAL NOT NULL DEFAULT 10.0")
 
     if db.execute("SELECT COUNT(*) FROM Members").fetchone()[0] == 0:
+        # CHANGED (Iskander): data comes from the SEED_* constants
         db.executemany(
             "INSERT INTO Members(name,email,membership_status,password_hash,role,balance) "
-            "VALUES (?,?,?,?,?,?)", [
-                ("Aldair", "aldair@kbtu.kz", "active", DEMO_PW_HASH, "admin", 85.0),
-                ("Iskander", "iskander@kbtu.kz", "active", DEMO_PW_HASH, "member", 85.0),
-                ("Adil", "adil@kbtu.kz", "active", DEMO_PW_HASH, "member", 100.0),
-                ("Zhanibek", "zhanibek@kbtu.kz", "active", DEMO_PW_HASH, "member", 100.0),
-                ("Expired Member", "expired@kbtu.kz", "expired", DEMO_PW_HASH, "member", 100.0),
-            ])
+            "VALUES (?,?,?,?,?,?)",
+            [(n, e, st, DEMO_PW_HASH, r, bal) for n, e, st, r, bal in SEED_MEMBERS])
         db.executemany(
             "INSERT INTO Sessions(title,trainer,session_date,start_time,capacity,price) "
-            "VALUES (?,?,?,?,?,?)", [
-                ("Yoga", "Aigerim", day(1), "10:00", 2, 15.0),
-                ("Boxing", "Daniyar", day(2), "18:00", 3, 20.0),
-                ("Fitness", "Madina", day(3), "09:00", 4, 12.0),
-                ("Yoga (past)", "Aigerim", day(-1), "10:00", 5, 15.0),
-            ])
+            "VALUES (?,?,?,?,?,?)",
+            [(t, tr, day(off), tm, cap, pr) for t, tr, off, tm, cap, pr in SEED_SESSIONS])
         now = datetime.now().isoformat(timespec="seconds")
-        # Yoga is already full: members 1 and 2 (each paid 15.0 from initial 100.0)
         db.executemany(
             "INSERT INTO Bookings(member_id,session_id,status,booked_at) VALUES (?,?,?,?)",
-            [(1, 1, "confirmed", now), (2, 1, "confirmed", now)])
+            [(m, s, "confirmed", now) for m, s in SEED_BOOKINGS])
         db.executemany(
             "INSERT INTO Payments(member_id,session_id,amount,status,created_at) VALUES (?,?,?,?,?)",
-            [(1, 1, 15.0, "paid", now), (2, 1, 15.0, "paid", now)])
+            [(m, s, SEED_SESSIONS[s - 1][5], "paid", now) for m, s in SEED_BOOKINGS])
+        if extended:  # ADDED (Iskander): only the real gym.db, never the test databases
+            seed_extended(db)
     else:
         # Old members without a password get the demo password; make sure one admin exists
         db.execute("UPDATE Members SET password_hash=? WHERE password_hash=''", (DEMO_PW_HASH,))
@@ -175,10 +257,61 @@ def seed_db(db):
     db.commit()
 
 
+def seed_extended(db):
+    """ADDED (Iskander): fill a NEW gym.db with a realistic two-week timetable, 30 more members and
+    their bookings + payments. Deterministic (fixed random seed). Called only by init_db()."""
+    rng = random.Random(2026)
+    now = datetime.now()
+    for title, cap in EXT_CAPACITY_UPGRADE.items():  # bigger halls for the 4 core sessions
+        db.execute("UPDATE Sessions SET capacity=? WHERE title=?", (cap, title))
+
+    first_id = db.execute("SELECT COALESCE(MAX(member_id), 0) FROM Members").fetchone()[0] + 1
+    db.executemany(
+        "INSERT INTO Members(name,email,membership_status,password_hash,role,balance) "
+        "VALUES (?,?,'active',?,'member',?)",
+        [(n, f"{n.lower()}@kbtu.kz", DEMO_PW_HASH, EXT_START_BALANCE) for n in EXT_MEMBER_NAMES])
+    ext_ids = list(range(first_id, first_id + len(EXT_MEMBER_NAMES)))
+    spent = {m: 0.0 for m in ext_ids}
+    counts = {"sessions": 0, "bookings": 0}
+
+    def add_session(title, trainer, date, time, cap, price, n_booked):
+        cur = db.execute("INSERT INTO Sessions(title,trainer,session_date,start_time,capacity,price) "
+                         "VALUES (?,?,?,?,?,?)", (title, trainer, date, time, cap, price))
+        sid = cur.lastrowid
+        start = datetime.fromisoformat(f"{date}T{time}")
+        for m in rng.sample(ext_ids, max(0, min(n_booked, cap, len(ext_ids)))):
+            if start > now:  # future session: booked during the last days
+                booked = now - timedelta(hours=rng.randint(1, 24 * 6))
+            else:            # past session: booked a few days before it
+                booked = start - timedelta(hours=rng.randint(6, 72))
+            stamp = booked.isoformat(timespec="seconds")
+            db.execute("INSERT INTO Bookings(member_id,session_id,status,booked_at) VALUES (?,?,'confirmed',?)",
+                       (m, sid, stamp))
+            db.execute("INSERT INTO Payments(member_id,session_id,amount,status,created_at) "
+                       "VALUES (?,?,?,'paid',?)", (m, sid, price, stamp))
+            spent[m] += price
+            counts["bookings"] += 1
+        counts["sessions"] += 1
+
+    for offset in range(-EXT_DAYS_BACK, EXT_DAYS_AHEAD + 1):
+        d = now.date() + timedelta(days=offset)
+        for title, trainer, weekdays, time, cap, price, fill in EXT_SCHEDULE:
+            if d.weekday() in weekdays:
+                n = round(cap * fill * rng.uniform(0.8, 1.15) * (0.75 if offset >= 0 else 1.0))
+                add_session(title, trainer, d.isoformat(), time, cap, price, n)
+    # a tiny private session that is already full, to demo the "session is full" message
+    add_session("Private Coaching", "Daniyar", day(2), "16:00", 2, 40.0, 2)
+
+    db.executemany("UPDATE Members SET balance=ROUND(?,2) WHERE member_id=?",
+                   [(max(20.0, EXT_START_BALANCE - s), m) for m, s in spent.items()])  # never negative
+    log_action(db, None, "system.seed", "demo data",
+               f"Loaded {len(ext_ids)} members, {counts['sessions']} sessions, {counts['bookings']} bookings")
+
+
 def init_db():
     db = sqlite3.connect(DB)
     try:
-        seed_db(db)
+        seed_db(db, extended=True)  # CHANGED (Iskander): bigger demo data for the real gym.db
     finally:
         db.close()
     _initialized_dbs.add(DB)
@@ -190,6 +323,120 @@ def ensure_db_initialized():
         with _init_lock:
             if DB not in _initialized_dbs or (DB != ":memory:" and not os.path.exists(DB)):
                 init_db()
+
+
+# =====================================================================
+# DONE BY: Iskander - schema check (python app.py --check)
+# =====================================================================
+EXPECTED_SCHEMA = {  # table -> {column: (type, NOT NULL)}
+    "Members": {"member_id": ("INTEGER", 0), "name": ("TEXT", 1), "email": ("TEXT", 1),
+                "membership_status": ("TEXT", 1), "password_hash": ("TEXT", 1), "role": ("TEXT", 1),
+                "balance": ("REAL", 1), "failed_attempts": ("INTEGER", 1), "locked_until": ("TEXT", 0)},
+    "Sessions": {"session_id": ("INTEGER", 0), "title": ("TEXT", 1), "trainer": ("TEXT", 1),
+                 "session_date": ("TEXT", 1), "start_time": ("TEXT", 1), "capacity": ("INTEGER", 1),
+                 "price": ("REAL", 1)},
+    "Bookings": {"booking_id": ("INTEGER", 0), "member_id": ("INTEGER", 1), "session_id": ("INTEGER", 1),
+                 "status": ("TEXT", 1), "booked_at": ("TEXT", 1)},
+    "Payments": {"payment_id": ("INTEGER", 0), "member_id": ("INTEGER", 1), "session_id": ("INTEGER", 1),
+                 "amount": ("REAL", 1), "status": ("TEXT", 1), "created_at": ("TEXT", 1),
+                 "refunded_at": ("TEXT", 0)},
+    "PasswordResets": {"token": ("TEXT", 0), "member_id": ("INTEGER", 1), "expires_at": ("TEXT", 1),
+                       "used": ("INTEGER", 1)},
+    "AuditLog": {"log_id": ("INTEGER", 0), "created_at": ("TEXT", 1), "actor_id": ("INTEGER", 0),
+                 "actor_name": ("TEXT", 1), "action": ("TEXT", 1), "target": ("TEXT", 1),
+                 "details": ("TEXT", 1)},
+}
+EXPECTED_FKS = {  # table -> {(parent table, column, on delete)}
+    "Bookings": {("Members", "member_id", "CASCADE"), ("Sessions", "session_id", "CASCADE")},
+    "Payments": {("Members", "member_id", "CASCADE")},  # no FK to Sessions: payment history survives
+    "PasswordResets": {("Members", "member_id", "CASCADE")},
+    "AuditLog": set(),                                  # no FKs: the log survives deleting anything
+}
+# bad rows that the database itself must reject (CHECK constraints)
+BAD_ROWS = [
+    ("membership_status only active/expired",
+     "INSERT INTO Members(name,email,membership_status) VALUES ('x','chk1@x.kz','banned')"),
+    ("role only member/admin",
+     "INSERT INTO Members(name,email,role) VALUES ('x','chk2@x.kz','boss')"),
+    ("Bookings.status only confirmed/cancelled",
+     "INSERT INTO Bookings(member_id,session_id,status,booked_at) VALUES (1,1,'maybe','x')"),
+    ("Payments.status only paid/refunded",
+     "INSERT INTO Payments(member_id,session_id,amount,status,created_at) VALUES (1,1,1,'lost','x')"),
+    ("session date must look like YYYY-MM-DD",
+     "INSERT INTO Sessions(title,trainer,session_date,start_time,capacity) VALUES ('a','b','12.11.2026','10:00',5)"),
+    ("session time must look like HH:MM",
+     "INSERT INTO Sessions(title,trainer,session_date,start_time,capacity) VALUES ('a','b','2030-01-01','10am',5)"),
+    ("session capacity must be > 0",
+     "INSERT INTO Sessions(title,trainer,session_date,start_time,capacity) VALUES ('a','b','2030-01-01','10:00',0)"),
+    ("session price must be >= 0",
+     "INSERT INTO Sessions(title,trainer,session_date,start_time,capacity,price) VALUES ('a','b','2030-01-01','10:00',5,-1)"),
+    ("audit action must look like kind.what",
+     "INSERT INTO AuditLog(created_at,actor_name,action) VALUES ('x','x','nodot')"),
+]
+
+
+def check_schema():
+    """Compare gym.db with EXPECTED_SCHEMA, test the DB rules and the data. Returns 0 if OK, else 1."""
+    problems = []
+
+    def check(cond, ok, bad):
+        print(("[OK]   " + ok) if cond else ("[FAIL] " + bad))
+        if not cond:
+            problems.append(bad)
+
+    db = sqlite3.connect(DB)
+    db.execute("PRAGMA foreign_keys = ON")
+    hint = " (old gym.db? run: python app.py --reset)"
+    # 1. tables, columns, types
+    for table, cols in EXPECTED_SCHEMA.items():
+        info = {r[1]: (r[2].upper(), r[3]) for r in db.execute(f"PRAGMA table_info({table})")}
+        check(bool(info), f"table {table} exists", f"table {table} is missing" + hint)
+        for col, (typ, nn) in cols.items():
+            check(info.get(col) == (typ, nn), f"{table}.{col} {typ}",
+                  f"{table}.{col}: expected {typ}, NOT NULL={nn}, found {info.get(col)}" + hint)
+    # 2. UNIQUE and foreign keys (with ON DELETE CASCADE)
+    uniq = [[c[2] for c in db.execute(f"PRAGMA index_info({i[1]})")]
+            for i in db.execute("PRAGMA index_list(Bookings)")]
+    check(["member_id", "session_id"] in uniq, "Bookings: UNIQUE(member_id, session_id)",
+          "Bookings: UNIQUE(member_id, session_id) is missing")
+    for table, expected in EXPECTED_FKS.items():
+        fks = {(r[2], r[3], r[6]) for r in db.execute(f"PRAGMA foreign_key_list({table})")}
+        check(fks == expected, f"foreign keys of {table}: {sorted(expected) or 'none'}",
+              f"foreign keys of {table} are wrong: {sorted(fks)}" + hint)
+    # 3. the database itself rejects bad rows (each insert is rolled back)
+    for rule, sql in BAD_ROWS:
+        try:
+            db.execute(sql)
+            rejected = False
+        except sqlite3.IntegrityError as e:
+            rejected = "CHECK" in str(e)
+        finally:
+            db.rollback()
+        check(rejected, f"DB rejects bad data: {rule}", f"DB accepts bad data: {rule}" + hint)
+    # 3b. the audit log is append-only
+    try:
+        db.execute("INSERT INTO AuditLog(created_at,actor_name,action) VALUES ('x','x','system.check')")
+        db.execute("UPDATE AuditLog SET target='tampered' WHERE action='system.check'")
+        blocked = False
+    except sqlite3.IntegrityError as e:
+        blocked = "append-only" in str(e)
+    finally:
+        db.rollback()
+    check(blocked, "AuditLog rows cannot be changed (append-only trigger)",
+          "AuditLog rows can be changed: the append-only trigger is missing" + hint)
+    # 4. data integrity
+    q = lambda sql: db.execute(sql).fetchall()
+    check(not q("PRAGMA foreign_key_check"), "no broken references", "rows point to missing members/sessions")
+    check(bool(q("SELECT 1 FROM Members WHERE role='admin'")), "at least one admin", "no admin in Members")
+    check(not q("SELECT 1 FROM Members WHERE password_hash=''"),
+          "every member has a password hash", "members without a password")
+    check(not q("SELECT 1 FROM Members WHERE balance < 0"), "no negative balances", "a member has a negative balance")
+    check(not q("""SELECT 1 FROM Sessions s WHERE (SELECT COUNT(*) FROM Bookings b
+                   WHERE b.session_id=s.session_id AND b.status='confirmed') > s.capacity"""),
+          "no session is over capacity", "a session has more bookings than capacity")
+    db.close()
+    print("\nRESULT:", "matches the schema" if not problems else f"{len(problems)} problem(s) found")
+    return 1 if problems else 0
 
 
 def _starts(row):
@@ -804,6 +1051,232 @@ def get_member_bookings(db, member_id):
 
 
 # =====================================================================
+# DONE BY: Iskander - ADMIN AUDIT LOG
+#   Every admin action is written to the AuditLog table (who, what, which object, details).
+#   The database itself blocks changing or deleting a log row (triggers in SCHEMA).
+#   The admin_* wrappers below call the original functions and log only when they succeeded.
+# =====================================================================
+AUDIT_KINDS = {  # action prefix -> name of the filter on the audit page
+    "session": "Trainings", "member": "Members", "booking": "Bookings",
+    "auth": "Sign-ins", "security": "Security alerts", "system": "System",
+}
+AUDIT_ACTIONS = {  # action -> (human text, badge colour class)
+    "session.create": ("Created training", ""),
+    "session.update": ("Changed training", "blue"),
+    "session.delete": ("Deleted training", "red"),
+    "member.status": ("Changed membership", "amber"),
+    "member.role": ("Changed role", "amber"),
+    "booking.cancel": ("Cancelled a booking", "red"),
+    "auth.admin_login": ("Admin sign-in", "grey"),
+    "security.lockout": ("Account locked", "red"),
+    "system.seed": ("Demo data loaded", "grey"),
+}
+
+
+def log_action(db, actor, action, target="", details=""):
+    """Append one row to AuditLog. actor is a Members row/dict, or None for the system."""
+    actor_id = actor["member_id"] if actor is not None else None
+    actor_name = actor["name"] if actor is not None else "system"
+    with db:
+        db.execute("INSERT INTO AuditLog(created_at,actor_id,actor_name,action,target,details) "
+                   "VALUES (?,?,?,?,?,?)",
+                   (datetime.now().isoformat(timespec="seconds"), actor_id, actor_name,
+                    action, target, details))
+
+
+def get_audit_log(db, kind="", q="", limit=100):
+    """Newest first. kind = prefix from AUDIT_KINDS ('' = all), q = text searched in admin/target/details."""
+    kind = kind if kind in AUDIT_KINDS else ""
+    like = f"%{(q or '').strip()}%"
+    rows = db.execute("""
+        SELECT * FROM AuditLog
+        WHERE (? = '' OR action LIKE ? || '.%')
+          AND (actor_name LIKE ? OR target LIKE ? OR details LIKE ?)
+        ORDER BY log_id DESC LIMIT ?""", (kind, kind, like, like, like, max(1, int(limit)))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_audit_summary(db):
+    since = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
+    top = db.execute("""SELECT actor_name, COUNT(*) AS n FROM AuditLog
+                        GROUP BY actor_name ORDER BY n DESC, actor_name LIMIT 1""").fetchone()
+    by_kind = db.execute("""SELECT substr(action, 1, instr(action, '.') - 1) AS kind, COUNT(*) AS n
+                            FROM AuditLog GROUP BY kind ORDER BY n DESC""").fetchall()
+    return {
+        "total": db.execute("SELECT COUNT(*) FROM AuditLog").fetchone()[0],
+        "last_24h": db.execute("SELECT COUNT(*) FROM AuditLog WHERE created_at >= ?", (since,)).fetchone()[0],
+        "top_actor": dict(top) if top else None,
+        "by_kind": [{"kind": r["kind"], "label": AUDIT_KINDS.get(r["kind"], r["kind"]), "n": r["n"]}
+                    for r in by_kind],
+    }
+
+
+def describe_booking(db, booking_id):
+    """Who owns a booking and what it is (read BEFORE the booking is cancelled)."""
+    r = db.execute("""SELECT b.member_id, m.name, s.title, s.session_date
+                      FROM Bookings b JOIN Members m USING(member_id) JOIN Sessions s USING(session_id)
+                      WHERE b.booking_id=?""", (booking_id,)).fetchone()
+    if r is None:
+        return None
+    return {"member_id": r["member_id"], "label": f"{r['name']}: {r['title']} {r['session_date']}"}
+
+
+def admin_create_session(db, actor, title, trainer, date, time, capacity, price=DEFAULT_SESSION_PRICE):
+    ok, msg = create_session(db, title, trainer, date, time, capacity, price)
+    if ok:
+        log_action(db, actor, "session.create", (title or "").strip(), msg)
+    return ok, msg
+
+
+def admin_update_session(db, actor, session_id, title, trainer, date, time, capacity, price=None):
+    old = db.execute("SELECT * FROM Sessions WHERE session_id=?", (session_id,)).fetchone()
+    ok, msg = update_session(db, session_id, title, trainer, date, time, capacity, price)
+    if ok:
+        new = db.execute("SELECT * FROM Sessions WHERE session_id=?", (session_id,)).fetchone()
+        keys = ("title", "trainer", "session_date", "start_time", "capacity", "price")
+        changes = [f"{k}: {old[k]} -> {new[k]}" for k in keys if old[k] != new[k]]
+        log_action(db, actor, "session.update", f"{new['title']} (#{session_id})",
+                   "; ".join(changes) or "no field changed")
+    return ok, msg
+
+
+def admin_delete_session(db, actor, session_id):
+    row = db.execute("SELECT title, session_date, start_time FROM Sessions WHERE session_id=?",
+                     (session_id,)).fetchone()
+    n_bookings = db.execute("SELECT COUNT(*) FROM Bookings WHERE session_id=?", (session_id,)).fetchone()[0]
+    ok, msg = delete_session(db, session_id)
+    if ok:
+        log_action(db, actor, "session.delete", f"{row['title']} (#{session_id})",
+                   f"{row['session_date']} {row['start_time']}, {n_bookings} booking(s) removed")
+    return ok, msg
+
+
+def admin_toggle_status(db, actor, member_id):
+    m = db.execute("SELECT name FROM Members WHERE member_id=?", (member_id,)).fetchone()
+    ok, msg = toggle_member_status(db, member_id)
+    if ok:
+        log_action(db, actor, "member.status", f"{m['name']} (#{member_id})", msg)
+    return ok, msg
+
+
+def admin_toggle_role(db, actor, member_id):
+    m = db.execute("SELECT name FROM Members WHERE member_id=?", (member_id,)).fetchone()
+    ok, msg = toggle_member_role(db, actor["member_id"], member_id)
+    if ok:
+        log_action(db, actor, "member.role", f"{m['name']} (#{member_id})", msg)
+    return ok, msg
+
+
+def cancel_booking_audited(db, actor, booking_id, is_admin):
+    """cancel_booking + a log row when an admin cancels somebody else's booking."""
+    info = describe_booking(db, booking_id) if is_admin else None
+    ok, msg = cancel_booking(db, actor["member_id"], booking_id, is_admin=is_admin)
+    if ok and info and info["member_id"] != actor["member_id"]:
+        log_action(db, actor, "booking.cancel", info["label"], msg)
+    return ok, msg
+
+
+# =====================================================================
+# DONE BY: Iskander - statistics for the admin (page /stats)
+#   Every number comes from an SQL query with JOIN + GROUP BY, not from Python loops.
+# =====================================================================
+def get_stats(db):
+    sessions = [dict(r) for r in db.execute("""
+        SELECT s.session_id, s.title, s.trainer, s.session_date, s.start_time, s.capacity,
+               COUNT(b.booking_id) AS taken,
+               ROUND(100.0 * COUNT(b.booking_id) / s.capacity) AS load_pct
+        FROM Sessions s
+        LEFT JOIN Bookings b ON b.session_id = s.session_id AND b.status = 'confirmed'
+        GROUP BY s.session_id
+        ORDER BY load_pct DESC, s.session_date, s.start_time""")]
+    trainers = [dict(r) for r in db.execute("""
+        SELECT s.trainer, COUNT(DISTINCT s.session_id) AS sessions, COUNT(b.booking_id) AS bookings
+        FROM Sessions s
+        LEFT JOIN Bookings b ON b.session_id = s.session_id AND b.status = 'confirmed'
+        GROUP BY s.trainer
+        ORDER BY bookings DESC, s.trainer""")]
+    idle_members = [dict(r) for r in db.execute("""
+        SELECT m.name, m.email, m.membership_status
+        FROM Members m
+        LEFT JOIN Bookings b ON b.member_id = m.member_id AND b.status = 'confirmed'
+        WHERE b.booking_id IS NULL
+        ORDER BY m.name""")]
+    totals = {
+        "members": db.execute("SELECT COUNT(*) FROM Members").fetchone()[0],
+        "sessions": len(sessions),
+        "bookings": sum(s["taken"] for s in sessions),
+        "avg_load": round(sum(s["load_pct"] for s in sessions) / len(sessions)) if sessions else 0,
+    }
+    return {"sessions": sessions[:12], "trainers": trainers, "idle_members": idle_members, "totals": totals}
+
+
+# =====================================================================
+# DONE BY: Iskander - club occupancy (chart on the main page, replaces the old date chart)
+#   Estimated from the confirmed bookings, like "popular times": for every weekday and hour we count
+#   the booked people and divide by CLUB_CAPACITY (people the club holds at once = 100%).
+#   So 2 booked people in a club for 60 are about 3%, not "100%".
+# =====================================================================
+CLUB_OPEN, CLUB_CLOSE = 6, 24  # working hours of the club -> columns 6:00 ... 23:00
+CLUB_CAPACITY = 50             # people the club holds at once = 10 segments (100%)
+SESSION_HOURS = 1              # Sessions has no duration column: every session is assumed to last 1 hour
+LOAD_STEPS = 10                # a column has 10 segments
+
+
+def load_label(level):
+    """Word for a load level 0..10 (shown under the title and in the tooltips)."""
+    if level >= 7:
+        return "High"
+    if level >= 4:
+        return "Medium"
+    if level >= 1:
+        return "Low"
+    return "No bookings"
+
+
+def get_club_load(db, now=None, club_capacity=None):
+    """Data for the occupancy chart: levels[weekday 0=Mon][hour index] = 0..10."""
+    now = now or datetime.now()
+    cap = club_capacity or CLUB_CAPACITY
+    hours = list(range(CLUB_OPEN, CLUB_CLOSE))
+    people = [[0.0] * len(hours) for _ in range(7)]  # booked people per weekday and hour
+    dates = [set() for _ in range(7)]                # dates of each weekday that have sessions
+    rows = db.execute("""
+        SELECT s.session_date, s.start_time, COUNT(b.booking_id) AS taken
+        FROM Sessions s
+        LEFT JOIN Bookings b ON b.session_id = s.session_id AND b.status = 'confirmed'
+        GROUP BY s.session_id""").fetchall()
+    for r in rows:
+        try:
+            d = datetime.strptime(r["session_date"], "%Y-%m-%d").date()
+            h, m = map(int, r["start_time"].split(":"))
+        except ValueError:
+            continue  # a broken date/time must not break the page
+        wd = d.weekday()
+        dates[wd].add(d)
+        start = h * 60 + m
+        end = start + SESSION_HOURS * 60
+        for i, hour in enumerate(hours):  # the session occupies every hour it overlaps
+            if start < (hour + 1) * 60 and end > hour * 60:
+                people[wd][i] += r["taken"]
+    for wd in range(7):  # average over the dates of that weekday, so one busy date does not rule
+        if dates[wd]:
+            people[wd] = [p / len(dates[wd]) for p in people[wd]]
+    levels = [[0 if p == 0 else max(1, min(LOAD_STEPS, round(LOAD_STEPS * p / cap))) for p in row]
+              for row in people]
+    i_now = now.hour - CLUB_OPEN
+    in_hours = 0 <= i_now < len(hours)
+    now_level = levels[now.weekday()][i_now] if in_hours else 0
+    return {
+        "hours": hours, "close": CLUB_CLOSE, "steps": LOAD_STEPS, "today": now.weekday(),
+        "capacity": cap, "levels": levels,
+        "labels": [[load_label(l) for l in row] for row in levels],
+        "people": [[round(p, 1) for p in row] for row in people],
+        "now_level": now_level,
+        "now_label": load_label(now_level) if in_hours else "Closed",
+    }
+
+
+# =====================================================================
 # TESTS RUN IN THE INTERFACE (page /tests). Every test uses its own fresh
 # in-memory database, so the real gym.db is never touched.
 # Demo data: members 1 Aldair(admin) 2 Iskander 3 Adil 4 Zhanibek 5 Expired;
@@ -813,6 +1286,7 @@ G_ALDAIR = "Aldair - 20 test functions"
 G_ADIL = "Adil - cancellation case"
 G_TOREZHAN = "Torezhan - 10 user cases (test as user)"
 G_SPRINT3 = "Sprint 3 - Payments, RBAC, Occupancy & Security (19 cases)"
+G_ISKANDER = "Iskander - database rules, audit log, statistics, club occupancy (22 tests)"  # ADDED (Iskander)
 TESTS = []
 
 
@@ -1365,6 +1839,233 @@ def occupancy_metrics_calculation():
     assert occ2["total_booked"] == 4 and occ2["by_date"][1]["level"] == "medium"
 
 
+# ---------- DONE BY: Iskander - database rules, audit log, statistics, club occupancy ----------
+def rejected(db, sql, kind):
+    """True if the database refuses this statement with an IntegrityError of the given kind."""
+    try:
+        db.execute(sql)
+    except sqlite3.IntegrityError as e:
+        return kind in str(e)
+    return False
+
+
+def admin_of(db):
+    return db.execute("SELECT * FROM Members WHERE member_id=1").fetchone()  # Aldair
+
+
+@case(G_ISKANDER)
+def db_rejects_bad_membership_status():
+    """CHECK: membership_status other than active/expired is rejected by the database"""
+    assert rejected(fresh_db(), "INSERT INTO Members(name,email,membership_status) "
+                                "VALUES ('X','x@kbtu.kz','banned')", "CHECK")
+
+
+@case(G_ISKANDER)
+def db_rejects_bad_role():
+    """CHECK: role other than member/admin is rejected by the database"""
+    assert rejected(fresh_db(), "INSERT INTO Members(name,email,role) VALUES ('X','x@kbtu.kz','boss')", "CHECK")
+
+
+@case(G_ISKANDER)
+def db_rejects_bad_booking_status():
+    """CHECK: Bookings.status other than confirmed/cancelled is rejected"""
+    assert rejected(fresh_db(), "INSERT INTO Bookings(member_id,session_id,status,booked_at) "
+                                "VALUES (3,2,'maybe','x')", "CHECK")
+
+
+@case(G_ISKANDER)
+def db_rejects_bad_date_format():
+    """CHECK: a session date that is not YYYY-MM-DD is rejected"""
+    assert rejected(fresh_db(), "INSERT INTO Sessions(title,trainer,session_date,start_time,capacity) "
+                                "VALUES ('A','B','12.11.2026','10:00',5)", "CHECK")
+
+
+@case(G_ISKANDER)
+def db_foreign_key_blocks_unknown_member():
+    """Foreign key: a booking for a member who does not exist is rejected"""
+    assert rejected(fresh_db(), "INSERT INTO Bookings(member_id,session_id,status,booked_at) "
+                                "VALUES (999,2,'confirmed','x')", "FOREIGN KEY")
+
+
+@case(G_ISKANDER)
+def db_cascade_deletes_session_and_member_bookings():
+    """ON DELETE CASCADE: deleting a session or a member removes their bookings automatically"""
+    db = fresh_db()
+    db.execute("DELETE FROM Sessions WHERE session_id=1")
+    assert taken_of(db, 1) == 0
+    db = fresh_db()
+    db.execute("DELETE FROM Members WHERE member_id=1")
+    assert db.execute("SELECT COUNT(*) FROM Bookings WHERE member_id=1").fetchone()[0] == 0
+
+
+@case(G_ISKANDER)
+def db_payment_history_survives_session_deletion():
+    """With foreign keys ON, deleting a training still works and the payments stay as history"""
+    db = fresh_db()
+    ok, msg = delete_session(db, 1)
+    assert ok, msg
+    pays = get_member_payments(db, 2)
+    assert len(pays) == 1 and pays[0]["title"].startswith("Deleted session"), pays
+
+
+@case(G_ISKANDER)
+def db_extended_demo_data_is_consistent():
+    """Extended demo data: valid, no overbooking, no negative balances, expired members never book"""
+    db = fresh_db()
+    seed_extended(db)
+    assert db.execute("SELECT COUNT(*) FROM Members").fetchone()[0] >= 30
+    assert not db.execute("PRAGMA foreign_key_check").fetchall()
+    assert not db.execute("SELECT 1 FROM Members WHERE balance < 0").fetchall()
+    assert not db.execute("""SELECT 1 FROM Sessions s WHERE (SELECT COUNT(*) FROM Bookings b
+                             WHERE b.session_id=s.session_id) > s.capacity""").fetchall()
+    assert taken_of(db, 1) == 2 and db.execute("SELECT capacity FROM Sessions WHERE session_id=1").fetchone()[0] == 20
+
+
+@case(G_ISKANDER)
+def audit_logs_session_create_update_delete():
+    """Audit: creating, changing and deleting a training are logged with the admin and the details"""
+    db = fresh_db()
+    a = admin_of(db)
+    assert admin_create_session(db, a, "Spin", "Dana", day(5), "18:00", 10, 9.0)[0]
+    sid = db.execute("SELECT MAX(session_id) FROM Sessions").fetchone()[0]
+    assert admin_update_session(db, a, sid, "Spin", "Dana", day(5), "18:00", 20, 9.0)[0]
+    assert admin_delete_session(db, a, sid)[0]
+    log = get_audit_log(db, kind="session")
+    assert [e["action"] for e in log] == ["session.delete", "session.update", "session.create"], log
+    assert "capacity: 10 -> 20" in log[1]["details"] and log[0]["actor_name"] == "Aldair"
+
+
+@case(G_ISKANDER)
+def audit_failed_action_is_not_logged():
+    """Audit: an action that was rejected (capacity 0) leaves no log row"""
+    db = fresh_db()
+    ok, _ = admin_create_session(db, admin_of(db), "Bad", "T", day(5), "18:00", 0, 9.0)
+    assert not ok and get_audit_summary(db)["total"] == 0
+
+
+@case(G_ISKANDER)
+def audit_logs_member_changes():
+    """Audit: changing a membership status and a role are logged"""
+    db = fresh_db()
+    a = admin_of(db)
+    assert admin_toggle_status(db, a, 3)[0] and admin_toggle_role(db, a, 3)[0]
+    assert [e["action"] for e in get_audit_log(db, kind="member")] == ["member.role", "member.status"]
+
+
+@case(G_ISKANDER)
+def audit_logs_admin_cancel_of_other_members_booking_only():
+    """Audit: an admin cancelling someone else's booking is logged; cancelling their own is not"""
+    db = fresh_db()
+    a = admin_of(db)
+    assert cancel_booking_audited(db, a, booking_id_of(db, 1, 1), True)[0]  # admin's own booking
+    assert get_audit_summary(db)["total"] == 0
+    assert cancel_booking_audited(db, a, booking_id_of(db, 2, 1), True)[0]  # Iskander's booking
+    log = get_audit_log(db)
+    assert len(log) == 1 and log[0]["action"] == "booking.cancel" and "Iskander" in log[0]["target"], log
+
+
+@case(G_ISKANDER)
+def audit_log_is_append_only():
+    """Audit: the database refuses to change or delete a log row"""
+    db = fresh_db()
+    log_action(db, admin_of(db), "system.test", "x", "y")
+    assert rejected(db, "UPDATE AuditLog SET details='tampered'", "append-only")
+    assert rejected(db, "DELETE FROM AuditLog", "append-only")
+
+
+@case(G_ISKANDER)
+def audit_survives_member_deletion_and_filters_work():
+    """Audit: log rows stay after the admin is deleted; the type filter and the search work"""
+    db = fresh_db()
+    a = admin_of(db)
+    admin_toggle_status(db, a, 3)
+    admin_create_session(db, a, "Spin", "Dana", day(5), "18:00", 10, 9.0)
+    db.execute("DELETE FROM Members WHERE member_id=1")
+    assert get_audit_summary(db)["total"] == 2
+    assert [e["action"] for e in get_audit_log(db, kind="member")] == ["member.status"]
+    assert len(get_audit_log(db, q="Spin")) == 1 and get_audit_log(db, q="nothing-like-this") == []
+
+
+@case(G_ISKANDER)
+def stats_load_percent():
+    """Stats: Yoga load is 100%, Boxing 0%, and Boxing becomes 33% after one booking"""
+    db = fresh_db()
+    load = lambda: {s["title"]: int(s["load_pct"]) for s in get_stats(db)["sessions"]}
+    assert load()["Yoga"] == 100 and load()["Boxing"] == 0, load()
+    book_session(db, 3, 2)
+    assert load()["Boxing"] == 33, load()
+
+
+@case(G_ISKANDER)
+def stats_trainer_ranking():
+    """Stats: the trainer with the most bookings (Aigerim, 2) is listed first"""
+    t = get_stats(fresh_db())["trainers"]
+    assert t[0]["trainer"] == "Aigerim" and t[0]["bookings"] == 2, t
+
+
+@case(G_ISKANDER)
+def stats_members_without_bookings():
+    """Stats: members with no bookings are listed, and a member disappears after booking"""
+    db = fresh_db()
+    names = lambda: {m["name"] for m in get_stats(db)["idle_members"]}
+    assert names() == {"Adil", "Zhanibek", "Expired Member"}, names()
+    book_session(db, 3, 2)
+    assert names() == {"Zhanibek", "Expired Member"}, names()
+
+
+@case(G_ISKANDER)
+def club_load_two_people_are_not_full():
+    """Club load: 2 booked people in a club for CLUB_CAPACITY are level 1 (Low), not a full column"""
+    db = fresh_db()
+    wd = datetime.strptime(day(1), "%Y-%m-%d").weekday()  # Yoga is tomorrow at 10:00, 2 booked
+    lv = get_club_load(db)["levels"][wd]
+    assert lv[10 - CLUB_OPEN] == 1 and lv[11 - CLUB_OPEN] == 0, lv
+    assert load_label(lv[10 - CLUB_OPEN]) == "Low"
+
+
+@case(G_ISKANDER)
+def club_load_scale_follows_club_capacity():
+    """Club load: the same 2 people fill the whole column (10) when the club holds only 2; no bookings -> 0"""
+    db = fresh_db()
+    wd = datetime.strptime(day(1), "%Y-%m-%d").weekday()
+    assert get_club_load(db, club_capacity=2)["levels"][wd][10 - CLUB_OPEN] == LOAD_STEPS
+    db.execute("DELETE FROM Bookings")
+    assert all(l == 0 for row in get_club_load(db)["levels"] for l in row)
+
+
+@case(G_ISKANDER)
+def club_load_session_covers_two_hours():
+    """Club load: a session at 18:30 (1 hour long) fills both the 18:00 and the 19:00 columns"""
+    db = fresh_db()
+    d = day(4)
+    db.execute("INSERT INTO Sessions(title,trainer,session_date,start_time,capacity) "
+               "VALUES ('Late','T',?,'18:30',5)", (d,))
+    sid = db.execute("SELECT MAX(session_id) FROM Sessions").fetchone()[0]
+    db.execute("INSERT INTO Bookings(member_id,session_id,status,booked_at) VALUES (3,?,'confirmed','x')", (sid,))
+    lv = get_club_load(db)["levels"][datetime.strptime(d, "%Y-%m-%d").weekday()]
+    at = lambda h: lv[h - CLUB_OPEN]
+    assert at(18) > 0 and at(19) > 0 and at(17) == 0 and at(20) == 0, lv
+
+
+@case(G_ISKANDER)
+def club_load_ignores_closed_hours():
+    """Club load: a session at 03:00 (club closed) does not appear in the chart and does not crash"""
+    db = fresh_db()
+    d = day(5)
+    db.execute("INSERT INTO Sessions(title,trainer,session_date,start_time,capacity) "
+               "VALUES ('Night','T',?,'03:00',5)", (d,))
+    sid = db.execute("SELECT MAX(session_id) FROM Sessions").fetchone()[0]
+    db.execute("INSERT INTO Bookings(member_id,session_id,status,booked_at) VALUES (3,?,'confirmed','x')", (sid,))
+    assert sum(get_club_load(db)["levels"][datetime.strptime(d, "%Y-%m-%d").weekday()]) == 0
+
+
+@case(G_ISKANDER)
+def club_load_labels():
+    """Club load: levels 0, 1-3, 4-6, 7-10 are called No bookings, Low, Medium, High"""
+    assert [load_label(x) for x in (0, 1, 3, 4, 6, 7, 10)] == \
+        ["No bookings", "Low", "Low", "Medium", "Medium", "High", "High"]
+
+
 def run_all_tests():
     groups = {}
     for group, f in TESTS:
@@ -1428,6 +2129,43 @@ STYLE = """
  .occ-grid{display:grid;grid-template-columns:1fr 1.6fr;gap:14px;margin:14px 0}
  @media (max-width:720px){.occ-grid{grid-template-columns:1fr}}
  .chart-wrap{width:100%;overflow-x:auto}
+ /* Iskander: visual polish (nav pills, hover, focus, tables that scroll on a phone) */
+ a{color:#2563eb;text-decoration:none}
+ a:hover{text-decoration:underline}
+ .nav-links{display:flex;gap:4px;flex-wrap:wrap}
+ .nav-links a{padding:6px 12px;border-radius:999px;color:#374151}
+ .nav-links a:hover{background:#e5e7eb;text-decoration:none}
+ .nav-links a.active{background:#dbeafe;color:#1e40af;font-weight:600}
+ table tr:hover td{background:#f9fafb}
+ button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid #93c5fd;outline-offset:2px}
+ .table-wrap{overflow-x:auto}
+ .muted{color:#6b7280;font-size:13px}
+ .filters{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px}
+ .filters input[name=q]{min-width:220px}
+ .empty{text-align:center;color:#6b7280;padding:18px}
+ .mono{font-variant-numeric:tabular-nums;white-space:nowrap}
+ /* Iskander: club occupancy card */
+ .load-card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin:14px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+ .load-head{display:flex;justify-content:space-between;align-items:center;gap:12px}
+ .load-title{font-size:20px;color:#111827}
+ .load-sub{color:#6b7280;margin-top:2px}
+ .load-now{display:flex;gap:4px}
+ .load-now i{width:10px;height:22px;border-radius:4px;background:#e5e5ea;display:block}
+ .load-now i.on{background:#4a7f2d}
+ .load-tabs{display:flex;justify-content:space-between;margin:14px 0 12px;gap:2px}
+ .load-tabs button{background:none;color:#6b7280;font-weight:600;border-radius:16px;padding:8px 12px}
+ .load-tabs button:hover{background:#f1f1f4}
+ .load-tabs button.active{background:#f1f1f4;color:#111827}
+ .load-grid{display:grid;grid-template-columns:repeat(18,1fr);gap:4px}
+ .load-col{display:flex;flex-direction:column-reverse;gap:3px}
+ .load-col i{height:11px;border-radius:4px;background:#e5e5ea;display:block}
+ .load-col.l1 i.on{background:#b6d9a5}
+ .load-col.l2 i.on{background:#96c883}
+ .load-col.l3 i.on{background:#4a7f2d}
+ .load-axis{position:relative;height:22px;margin-top:6px;font-size:14px}
+ .load-axis span{position:absolute;transform:translateX(-50%)}
+ .load-note{color:#6b7280;font-size:12px;margin-top:8px}
+ @media (max-width:520px){.load-tabs button{padding:6px 7px;font-size:13px}.load-grid{gap:2px}}
  .wallet-bar{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 14px;margin:12px 0;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
 </style>
 """
@@ -1446,14 +2184,18 @@ NAV = """
     <span class="badge {{ '' if user.membership_status == 'active' else 'red' }}">{{ user.membership_status }}</span>
     &middot; Balance: <b>${{ "%.2f"|format(user.balance) }}</b>
   {% endif %}</span>
-  <span>
+  <span class="nav-links">
   {% if user %}
-    <a href="{{ url_for('index') }}">Sessions</a> |
-    {% if user.role == 'admin' %}<a href="{{ url_for('admin') }}">Admin</a> | {% endif %}
-    <a href="{{ url_for('tests') }}">Tests</a> |
+    <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint == 'index' }}">Sessions</a>
+    {% if user.role == 'admin' %}
+    <a href="{{ url_for('admin') }}" class="{{ 'active' if request.endpoint == 'admin' }}">Admin</a>
+    <a href="{{ url_for('stats') }}" class="{{ 'active' if request.endpoint == 'stats' }}">Stats</a>
+    <a href="{{ url_for('audit_log') }}" class="{{ 'active' if request.endpoint == 'audit_log' }}">Audit log</a>
+    {% endif %}
+    <a href="{{ url_for('tests') }}" class="{{ 'active' if request.endpoint == 'tests' }}">Tests</a>
     <a href="{{ url_for('logout') }}">Logout</a>
   {% else %}
-    <a href="{{ url_for('login') }}">Login</a> | <a href="{{ url_for('register') }}">Register</a>
+    <a href="{{ url_for('login') }}">Login</a> <a href="{{ url_for('register') }}">Register</a>
   {% endif %}
   </span>
 </div>
@@ -1463,53 +2205,68 @@ NAV = """
 """
 
 OCCUPANCY_WIDGET = """
-<div class="occ-grid">
-  <div class="card">
-    <div class="card-title">Upcoming Gym Occupancy</div>
-    <div class="card-value">
-      {{ occupancy.overall_pct }}%
-      <span class="badge {{ 'red' if occupancy.overall_level == 'high' else ('amber' if occupancy.overall_level == 'medium' else '') }}">
-        {{ occupancy.overall_label }}
-      </span>
+<!-- Iskander: club occupancy card (data from get_club_load(), drawn by the script below) -->
+<div class="load-card">
+  <div class="load-head">
+    <div>
+      <b class="load-title">Club occupancy</b>
+      <div class="load-sub">Now: {{ club_load.now_label }}
+        &middot; upcoming sessions: {{ occupancy.total_booked }} of {{ occupancy.total_capacity }} places booked</div>
     </div>
-    <div style="font-size:13px;color:#4b5563;margin-top:4px">
-      <b>{{ occupancy.total_booked }}</b> / {{ occupancy.total_capacity }} spots booked across
-      {{ occupancy.upcoming_sessions_count }} upcoming session(s)
-    </div>
-    <div class="progress-track">
-      <div class="progress-fill fill-{{ occupancy.overall_level }}" style="width:{{ occupancy.overall_pct }}%"></div>
-    </div>
-    <div style="font-size:12px;color:#6b7280;margin-top:8px">
-      Load legend: <span class="badge">Low &lt;60%</span>
-      <span class="badge amber">Medium 60-89%</span>
-      <span class="badge red">High &ge;90%</span>
-    </div>
+    <div class="load-now" title="Occupancy now">{% for i in range(club_load.steps) %}<i class="{{ 'on' if i < club_load.now_level }}"></i>{% endfor %}</div>
   </div>
-  <div class="card">
-    <div class="card-title">Gym Load by Upcoming Date</div>
-    {% if occupancy.by_date %}
-    {% set chart_w = [occupancy.by_date|length * 88 + 24, 340]|max %}
-    <div class="chart-wrap">
-      <svg width="{{ chart_w }}" height="126" viewBox="0 0 {{ chart_w }} 126" role="img" aria-label="Gym occupancy chart by date">
-        <line x1="8" y1="92" x2="{{ chart_w - 8 }}" y2="92" stroke="#d1d5db" stroke-width="1"/>
-        {% for d in occupancy.by_date %}
-          {% set x = 16 + loop.index0 * 88 %}
-          {% set bar_h = (d.pct * 0.68)|round|int %}
-          {% set bar_h = bar_h if bar_h > 4 else (4 if d.booked > 0 else 2) %}
-          {% set y = 92 - bar_h %}
-          {% set color = '#dc2626' if d.level == 'high' else ('#d97706' if d.level == 'medium' else '#16a34a') %}
-          <text x="{{ x + 28 }}" y="{{ y - 5 }}" text-anchor="middle" font-size="11" font-weight="600" fill="#374151">{{ d.pct }}%</text>
-          <rect x="{{ x + 8 }}" y="{{ y }}" width="40" height="{{ bar_h }}" rx="4" fill="{{ color }}"/>
-          <text x="{{ x + 28 }}" y="106" text-anchor="middle" font-size="10" fill="#374151">{{ d.date[5:] }}</text>
-          <text x="{{ x + 28 }}" y="119" text-anchor="middle" font-size="10" fill="#6b7280">{{ d.booked }}/{{ d.capacity }}</text>
-        {% endfor %}
-      </svg>
-    </div>
-    {% else %}
-    <p style="font-size:13px;color:#6b7280;margin:8px 0 0">No upcoming sessions scheduled.</p>
-    {% endif %}
-  </div>
+  <div class="load-tabs" id="load-tabs"></div>
+  <div class="load-grid" id="load-grid"></div>
+  <div class="load-axis" id="load-axis"></div>
+  <div class="load-note">Estimated from confirmed bookings (average per weekday, one session = 1 hour).
+    A full column = {{ club_load.capacity }} people in the club at once. Hover a column for details.</div>
 </div>
+<script>
+(function () {
+  var D = {{ club_load|tojson }};
+  var DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  var tabs = document.getElementById("load-tabs");
+  var grid = document.getElementById("load-grid");
+  var axis = document.getElementById("load-axis");
+  var current = D.today;
+  function pad(h) { return (h < 10 ? "0" : "") + h + ":00"; }
+  function draw() {
+    grid.innerHTML = "";
+    D.hours.forEach(function (h, i) {
+      var lvl = D.levels[current][i];
+      var col = document.createElement("div");
+      col.className = "load-col " + (lvl >= 7 ? "l3" : lvl >= 4 ? "l2" : "l1");
+      col.title = DAYS[current] + " " + pad(h) + ": " + D.labels[current][i] +
+                  (D.people[current][i] ? " (about " + D.people[current][i] + " of " + D.capacity + " people)" : "");
+      for (var s = 0; s < D.steps; s++) {
+        var seg = document.createElement("i");
+        if (s < lvl) { seg.className = "on"; }
+        col.appendChild(seg);
+      }
+      grid.appendChild(col);
+    });
+    Array.prototype.forEach.call(tabs.children, function (b, d) { b.className = (d === current ? "active" : ""); });
+  }
+  DAYS.forEach(function (name, d) {
+    var b = document.createElement("button");
+    b.type = "button"; b.textContent = name;
+    b.onclick = function () { current = d; draw(); };
+    tabs.appendChild(b);
+  });
+  var n = D.hours.length;
+  D.hours.forEach(function (h, i) {
+    if (h % 3 === 0) {
+      var t = document.createElement("span");
+      t.textContent = h; t.style.left = ((i + 0.5) / n * 100) + "%";
+      axis.appendChild(t);
+    }
+  });
+  var end = document.createElement("span");
+  end.textContent = D.close; end.style.left = "100%"; end.style.transform = "translateX(-100%)";
+  axis.appendChild(end);
+  draw();
+})();
+</script>
 """
 
 PAGE = HEAD + NAV + OCCUPANCY_WIDGET + """
@@ -1679,6 +2436,17 @@ ADMIN_PAGE = HEAD + NAV + OCCUPANCY_WIDGET + """
   </div>
 </div>
 
+<h2>Recent admin activity</h2>
+<div class="table-wrap"><table>
+  <tr><th>When</th><th>Admin</th><th>Action</th><th>Object</th></tr>
+  {% for e in recent_audit %}
+  {% set a = audit_actions.get(e.action, (e.action, 'grey')) %}
+  <tr><td class="mono">{{ e.created_at.replace('T', ' ') }}</td><td>{{ e.actor_name }}</td>
+      <td><span class="badge {{ a[1] }}">{{ a[0] }}</span></td><td>{{ e.target }}</td></tr>
+  {% else %}<tr><td colspan="4" class="empty">Nothing yet. Create, change or delete a training to see it here.</td></tr>{% endfor %}
+</table></div>
+<p class="muted"><a href="{{ url_for('audit_log') }}">Open the full audit log &rarr;</a></p>
+
 <h2>Trainings</h2>
 <h3>Create training</h3>
 <form method="post" action="{{ url_for('admin_session_create') }}" class="inline">
@@ -1778,6 +2546,83 @@ ADMIN_PAGE = HEAD + NAV + OCCUPANCY_WIDGET + """
 </body></html>
 """
 
+STATS_PAGE = HEAD + NAV + """
+<h2>Statistics</h2>
+<p class="muted">Every number below comes from an SQL query (JOIN + GROUP BY) on the live database.</p>
+<div class="cards">
+  <div class="card"><div class="card-title">Members</div><div class="card-value">{{ totals.members }}</div></div>
+  <div class="card"><div class="card-title">Trainings</div><div class="card-value">{{ totals.sessions }}</div></div>
+  <div class="card"><div class="card-title">Confirmed bookings</div><div class="card-value">{{ totals.bookings }}</div></div>
+  <div class="card"><div class="card-title">Average training fill</div><div class="card-value">{{ totals.avg_load }}%</div></div>
+</div>
+<h3>Fullest trainings (top 12)</h3>
+<div class="table-wrap"><table>
+  <tr><th>Training</th><th>Trainer</th><th>Date</th><th>Booked</th><th style="width:30%">Fill</th></tr>
+  {% for s in sessions %}
+  <tr><td>{{ s.title }}</td><td>{{ s.trainer }}</td><td class="mono">{{ s.session_date }} {{ s.start_time }}</td>
+      <td class="mono">{{ s.taken }} / {{ s.capacity }}</td>
+      <td><div class="progress-track" style="margin:0 0 3px"><div class="progress-fill {{ 'fill-high' if s.load_pct >= 90 else ('fill-medium' if s.load_pct >= 60 else 'fill-low') }}" style="width:{{ [s.load_pct|int, 100]|min }}%"></div></div>
+          <span class="muted">{{ s.load_pct|int }}%</span></td></tr>
+  {% else %}<tr><td colspan="5" class="empty">No trainings.</td></tr>{% endfor %}
+</table></div>
+<h3>Trainers</h3>
+<div class="table-wrap"><table>
+  <tr><th>Trainer</th><th>Trainings</th><th>Bookings</th></tr>
+  {% for t in trainers %}<tr><td>{{ t.trainer }}</td><td>{{ t.sessions }}</td><td>{{ t.bookings }}</td></tr>{% endfor %}
+</table></div>
+<h3>Members with no bookings</h3>
+<div class="table-wrap"><table>
+  <tr><th>Name</th><th>Email</th><th>Membership</th></tr>
+  {% for m in idle_members %}<tr><td>{{ m.name }}</td><td>{{ m.email }}</td>
+      <td><span class="badge {{ '' if m.membership_status == 'active' else 'red' }}">{{ m.membership_status }}</span></td></tr>
+  {% else %}<tr><td colspan="3" class="empty">Every member has at least one booking.</td></tr>{% endfor %}
+</table></div>
+</body></html>
+"""
+
+AUDIT_PAGE = HEAD + NAV + """
+<h2>Admin audit log</h2>
+<p class="muted">Every admin action is recorded here. Rows cannot be edited or deleted: the database blocks it.</p>
+<div class="cards">
+  <div class="card"><div class="card-title">Events recorded</div><div class="card-value">{{ summary.total }}</div></div>
+  <div class="card"><div class="card-title">Last 24 hours</div><div class="card-value">{{ summary.last_24h }}</div></div>
+  <div class="card"><div class="card-title">Most active</div>
+    <div class="card-value">{{ summary.top_actor.actor_name if summary.top_actor else '-' }}</div>
+    <div class="muted">{{ summary.top_actor.n ~ ' event(s)' if summary.top_actor else 'no events yet' }}</div></div>
+  <div class="card"><div class="card-title">By type</div>
+    {% for k in summary.by_kind %}<span class="badge grey">{{ k.label }}: {{ k.n }}</span> {% else %}<span class="muted">-</span>{% endfor %}</div>
+</div>
+<form method="get" action="{{ url_for('audit_log') }}" class="inline filters">
+  <select name="type" title="Type of action">
+    <option value="">All actions</option>
+    {% for key, label in kinds.items() %}<option value="{{ key }}" {{ 'selected' if key == kind }}>{{ label }}</option>{% endfor %}
+  </select>
+  <input name="q" placeholder="Search admin, object or details" value="{{ q }}">
+  <select name="limit" title="How many rows">
+    {% for n in (50, 100, 200) %}<option value="{{ n }}" {{ 'selected' if n == limit }}>Show {{ n }}</option>{% endfor %}
+  </select>
+  <button>Filter</button>
+  <a href="{{ url_for('audit_log') }}">Reset</a>
+</form>
+<div class="table-wrap"><table>
+  <tr><th>When</th><th>Admin</th><th>Action</th><th>Object</th><th>Details</th></tr>
+  {% for e in entries %}
+  {% set a = actions.get(e.action, (e.action, 'grey')) %}
+  <tr>
+    <td class="mono">{{ e.created_at.replace('T', ' ') }}</td>
+    <td>{{ e.actor_name }}</td>
+    <td><span class="badge {{ a[1] }}">{{ a[0] }}</span></td>
+    <td>{{ e.target }}</td>
+    <td class="muted">{{ e.details }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="empty">No events match. Admin actions will appear here.</td></tr>
+  {% endfor %}
+</table></div>
+<p class="muted">Showing {{ entries|length }} newest matching event(s).</p>
+</body></html>
+"""
+
 TESTS_PAGE = HEAD + NAV + """
 <h2>Tests: {{ passed }} / {{ total }} passed</h2>
 <p>Every test runs on a temporary in-memory database; the real <code>gym.db</code> is not changed.</p>
@@ -1808,7 +2653,11 @@ def login():
             session.clear()
             session["member_id"], session["role"] = m["member_id"], m["role"]
             csrf_token()
+            if m["role"] == "admin":  # ADDED (Iskander): audit log
+                log_action(get_db(), m, "auth.admin_login", m["email"], "Admin signed in")
             return redirect(url_for("index"))
+        if err and err.startswith("Too many failed"):  # ADDED (Iskander): audit log
+            log_action(get_db(), None, "security.lockout", request.form.get("email", "").strip().lower(), err)
         flash(err or "Wrong email or password.", "err")
     return render_template_string(LOGIN_PAGE, title="Login", user=None)
 
@@ -1872,7 +2721,9 @@ def index():
     db = get_db()
     user = current_user()
     q = request.args.get("q", "").strip()
-    upcoming = request.args.get("upcoming") == "1"
+    # CHANGED (Iskander): with the bigger timetable the page opens on upcoming sessions only
+    first_visit = "q" not in request.args and "upcoming" not in request.args
+    upcoming = True if first_visit else request.args.get("upcoming") == "1"
     sessions = search_sessions(db, q, upcoming)
     my_bookings = get_member_bookings(db, user["member_id"])
     my_payments = get_member_payments(db, user["member_id"])
@@ -1881,7 +2732,8 @@ def index():
         PAGE, title="Sessions", user=user, q=q, upcoming=upcoming, sessions=sessions,
         my_bookings=my_bookings, my_payments=my_payments, occupancy=occupancy,
         booked_ids={b["session_id"] for b in my_bookings},
-        upcoming_count=sum(1 for b in my_bookings if not b["is_past"]))
+        upcoming_count=sum(1 for b in my_bookings if not b["is_past"]),
+        club_load=get_club_load(db))  # ADDED (Iskander)
 
 
 @app.post("/topup")
@@ -1909,8 +2761,7 @@ def book():
 def cancel():
     user = current_user()
     is_admin = user["role"] == "admin"
-    ok, msg = cancel_booking(get_db(), user["member_id"],
-                             request.form.get("booking_id", type=int), is_admin=is_admin)
+    ok, msg = cancel_booking_audited(get_db(), user, request.form.get("booking_id", type=int), is_admin)
     flash(msg, "ok" if ok else "err")
     if is_admin and request.form.get("next") == "admin":
         return redirect(url_for("admin"))
@@ -1931,6 +2782,7 @@ def admin():
         ADMIN_PAGE, title="Admin", user=current_user(),
         sessions=search_sessions(db), bookings=bookings,
         members=get_all_members(db), occupancy=get_gym_occupancy(db),
+        club_load=get_club_load(db), recent_audit=get_audit_log(db, limit=5), audit_actions=AUDIT_ACTIONS,  # ADDED (Iskander)
         pay_summary=pay_summary, recent_payments=recent_payments)
 
 
@@ -1938,8 +2790,8 @@ def admin():
 @admin_required
 def admin_session_create():
     f = request.form
-    ok, msg = create_session(
-        get_db(), f.get("title"), f.get("trainer"),
+    ok, msg = admin_create_session(
+        get_db(), current_user(), f.get("title"), f.get("trainer"),
         f.get("session_date"), f.get("start_time"), f.get("capacity"),
         f.get("price", DEFAULT_SESSION_PRICE))
     flash(msg, "ok" if ok else "err")
@@ -1950,8 +2802,8 @@ def admin_session_create():
 @admin_required
 def admin_session_update():
     f = request.form
-    ok, msg = update_session(
-        get_db(), f.get("session_id", type=int), f.get("title"), f.get("trainer"),
+    ok, msg = admin_update_session(
+        get_db(), current_user(), f.get("session_id", type=int), f.get("title"), f.get("trainer"),
         f.get("session_date"), f.get("start_time"), f.get("capacity"),
         f.get("price"))
     flash(msg, "ok" if ok else "err")
@@ -1961,7 +2813,7 @@ def admin_session_update():
 @app.post("/admin/session/delete")
 @admin_required
 def admin_session_delete():
-    ok, msg = delete_session(get_db(), request.form.get("session_id", type=int))
+    ok, msg = admin_delete_session(get_db(), current_user(), request.form.get("session_id", type=int))
     flash(msg, "ok" if ok else "err")
     return redirect(url_for("admin"))
 
@@ -1969,7 +2821,7 @@ def admin_session_delete():
 @app.post("/admin/member/toggle-status")
 @admin_required
 def admin_member_toggle_status():
-    ok, msg = toggle_member_status(get_db(), request.form.get("member_id", type=int))
+    ok, msg = admin_toggle_status(get_db(), current_user(), request.form.get("member_id", type=int))
     flash(msg, "ok" if ok else "err")
     return redirect(url_for("admin"))
 
@@ -1978,10 +2830,30 @@ def admin_member_toggle_status():
 @admin_required
 def admin_member_toggle_role():
     actor = current_user()
-    ok, msg = toggle_member_role(
-        get_db(), actor["member_id"], request.form.get("member_id", type=int))
+    ok, msg = admin_toggle_role(get_db(), actor, request.form.get("member_id", type=int))
     flash(msg, "ok" if ok else "err")
     return redirect(url_for("admin"))
+
+
+# ---------- DONE BY: Iskander - statistics and audit log pages for the admin ----------
+@app.get("/stats")
+@admin_required
+def stats():
+    return render_template_string(STATS_PAGE, title="Stats", user=current_user(), **get_stats(get_db()))
+
+
+@app.get("/admin/audit")
+@admin_required
+def audit_log():
+    db = get_db()
+    kind = request.args.get("type", "")
+    q = request.args.get("q", "").strip()
+    limit = request.args.get("limit", 100, type=int)
+    limit = limit if limit in (50, 100, 200) else 100
+    return render_template_string(
+        AUDIT_PAGE, title="Audit log", user=current_user(), entries=get_audit_log(db, kind, q, limit),
+        summary=get_audit_summary(db), kinds=AUDIT_KINDS, actions=AUDIT_ACTIONS,
+        kind=kind, q=q, limit=limit)
 
 
 # ---------- DONE BY: Aldair (+ Adil, Torezhan, Sprint 3 groups) - tests in the interface ----------
@@ -1996,7 +2868,15 @@ def tests():
 
 
 if __name__ == "__main__":
+    # ADDED (Iskander): python app.py --reset (recreate gym.db), python app.py --check (check the schema).
+    # WERKZEUG_RUN_MAIN is set in the debug auto-reloader child, so the reset happens only once.
+    if "--reset" in sys.argv and DB != ":memory:" and os.path.exists(DB) \
+            and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        os.remove(DB)
+        _initialized_dbs.discard(DB)
     init_db()
+    if "--check" in sys.argv:
+        sys.exit(check_schema())
     port = int(os.environ.get("PORT", "5000"))
     debug = os.environ.get("FLASK_DEBUG", "1").lower() in ("1", "true", "yes")
     host = os.environ.get("HOST", "127.0.0.1")
