@@ -1,14 +1,8 @@
-# Virtual environments
-.venv/
+﻿.venv/
 venv/
-
-# Python bytecode & caches
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Local database & environment secrets
-gym.db
+*.pyc
 *.db
+*.sqlite3
 .env
-.env.*
+staticfiles/
