@@ -1,4 +1,4 @@
-"""31 automated tests for Gym Booking System (Flask + SQLite).
+"""Automated tests for Gym Booking System (Flask + SQLite).
 
 Run from the folder containing app.py:
     python -m unittest -v test_app
@@ -8,12 +8,15 @@ Each test uses its own temporary SQLite database; gym.db is not changed.
 Tests 01-10: booking, login, access control.
 Tests 11-20: cancellation, registration, admin training management.
 Tests 21-31: Sprint 3 payments, refunds, RBAC, lockout, password reset, CSRF, occupancy.
+Tests 32-39: Waitlist HTTP functional & edge-case tests.
+ConcurrencyTests (15 tests): Multithreaded race-condition tests with threading.Barrier.
 """
 
 import os
 import re
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from datetime import datetime, timedelta
@@ -484,10 +487,10 @@ class GymBookingTests(unittest.TestCase):
     def test_30_occupancy_dashboard_renders_on_home_and_admin(self):
         self.login("aldair@kbtu.kz")
         home = self.client.get("/")
-        self.assertIn(b"Upcoming Gym Occupancy", home.data)
-        self.assertIn(b"<svg", home.data)
+        self.assertIn(b"Club occupancy", home.data)
+        self.assertIn(b'id="load-grid"', home.data)
         admin_page = self.client.get("/admin")
-        self.assertIn(b"Upcoming Gym Occupancy", admin_page.data)
+        self.assertIn(b"Club occupancy", admin_page.data)
         self.assertIn(b"Payments &amp; Revenue Overview", admin_page.data)
 
     def test_31_regular_member_blocked_from_admin_member_routes(self):
@@ -509,6 +512,664 @@ class GymBookingTests(unittest.TestCase):
                 "SELECT role FROM Members WHERE member_id=3"
             ).fetchone()[0]
         self.assertEqual(role_3, "member")
+
+    # ------------------------------------------------------------------
+    # Tests 32-39: Waitlist HTTP functional & edge-case tests
+    # ------------------------------------------------------------------
+    def count_waitlist(self, session_id, member_id=None):
+        with closing(sqlite3.connect(app.DB)) as db:
+            if member_id is None:
+                return db.execute(
+                    "SELECT COUNT(*) FROM Waitlist WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()[0]
+            return db.execute(
+                "SELECT COUNT(*) FROM Waitlist WHERE session_id=? AND member_id=?",
+                (session_id, member_id),
+            ).fetchone()[0]
+
+    def test_32_waitlist_join_and_ui_on_full_session(self):
+        self.login()  # Adil (member 3)
+        before_bal = self.balance_of(3)
+        home_before = self.client.get("/")
+        self.assertIn(b"Join Waitlist", home_before.data)
+
+        resp = self.client.post(
+            "/waitlist/join", data={"session_id": "1"}, follow_redirects=True
+        )
+        self.assertIn(b"Joined waitlist for Yoga", resp.data)
+        self.assertIn(b"Position #1", resp.data)
+        self.assertIn(b"My Waitlist", resp.data)
+        self.assertIn(b"Leave Waitlist (#1)", resp.data)
+        self.assertIn(b"Waitlist: 1", resp.data)
+        self.assertEqual(self.balance_of(3), before_bal)
+        self.assertEqual(self.count_waitlist(1, 3), 1)
+
+    def test_33_waitlist_rejects_open_past_expired_and_duplicate(self):
+        self.login()  # Adil (member 3)
+        # Open session -> told to book directly
+        r_open = self.client.post(
+            "/waitlist/join", data={"session_id": "2"}, follow_redirects=True
+        )
+        self.assertIn(b"book directly", r_open.data.lower())
+        self.assertEqual(self.count_waitlist(2), 0)
+
+        # Past session -> rejected
+        r_past = self.client.post(
+            "/waitlist/join", data={"session_id": "4"}, follow_redirects=True
+        )
+        self.assertIn(b"already started", r_past.data.lower())
+        self.assertEqual(self.count_waitlist(4), 0)
+
+        # Duplicate join on full session 1 -> rejected
+        self.client.post("/waitlist/join", data={"session_id": "1"})
+        r_dup = self.client.post(
+            "/waitlist/join", data={"session_id": "1"}, follow_redirects=True
+        )
+        self.assertIn(b"already on the waitlist", r_dup.data.lower())
+        self.assertEqual(self.count_waitlist(1, 3), 1)
+
+        # Expired member -> rejected
+        self.login("expired@kbtu.kz")
+        r_exp = self.client.post(
+            "/waitlist/join", data={"session_id": "1"}, follow_redirects=True
+        )
+        self.assertIn(b"expired", r_exp.data.lower())
+        self.assertEqual(self.count_waitlist(1, 5), 0)
+
+    def test_34_waitlist_leave_own_and_block_non_admin_removing_others(self):
+        # Zhanibek (4) joins Yoga waitlist
+        self.login("zhanibek@kbtu.kz")
+        self.client.post("/waitlist/join", data={"session_id": "1"})
+        self.assertEqual(self.count_waitlist(1, 4), 1)
+
+        # Adil (3, non-admin) tries to remove Zhanibek (4) -> blocked
+        self.login("adil@kbtu.kz")
+        r_block = self.client.post(
+            "/waitlist/leave",
+            data={"session_id": "1", "member_id": "4"},
+            follow_redirects=True,
+        )
+        self.assertIn(b"only remove yourself", r_block.data.lower())
+        self.assertEqual(self.count_waitlist(1, 4), 1)
+
+        # Zhanibek leaves own waitlist -> succeeds
+        self.login("zhanibek@kbtu.kz")
+        r_leave = self.client.post(
+            "/waitlist/leave", data={"session_id": "1"}, follow_redirects=True
+        )
+        self.assertIn(b"Left waitlist: Yoga", r_leave.data)
+        self.assertEqual(self.count_waitlist(1, 4), 0)
+
+    def test_35_waitlist_auto_promotion_on_cancel_via_http(self):
+        # Adil (3) joins Yoga ($15) waitlist
+        self.login("adil@kbtu.kz")
+        self.client.post("/waitlist/join", data={"session_id": "1"})
+        self.assertEqual(self.balance_of(3), 100.0)
+
+        # Admin cancels Iskander's (2) Yoga booking -> Adil auto-promoted
+        self.login("aldair@kbtu.kz")
+        iskander_bid = self.booking_id_of(2, 1)
+        resp = self.cancel(iskander_bid, next="admin")
+        self.assertIn(b"Cancelled: Yoga", resp.data)
+        self.assertIn(b"Waitlist auto-promoted: Adil", resp.data)
+        self.assertEqual(self.count_bookings(2, 1), 0)
+        self.assertEqual(self.count_bookings(3, 1), 1)
+        self.assertEqual(self.count_waitlist(1, 3), 0)
+        self.assertEqual(self.balance_of(2), 100.0)  # 85 + 15 refund
+        self.assertEqual(self.balance_of(3), 85.0)   # 100 - 15 paid
+
+    def test_36_admin_sees_waitlist_queue_and_can_remove_entry(self):
+        self.login("adil@kbtu.kz")
+        self.client.post("/waitlist/join", data={"session_id": "1"})
+
+        self.login("aldair@kbtu.kz")
+        admin_page = self.client.get("/admin")
+        self.assertIn(b"Waitlist Queue", admin_page.data)
+        self.assertIn(b"WL: 1", admin_page.data)
+        self.assertIn(b"adil@kbtu.kz", admin_page.data)
+
+        rem = self.client.post(
+            "/waitlist/leave",
+            data={"session_id": "1", "member_id": "3", "next": "admin"},
+            follow_redirects=True,
+        )
+        self.assertIn(b"Removed Adil from waitlist", rem.data)
+        self.assertEqual(self.count_waitlist(1, 3), 0)
+
+    def test_37_delete_session_cascades_waitlist_via_http(self):
+        self.login("adil@kbtu.kz")
+        self.client.post("/waitlist/join", data={"session_id": "1"})
+        self.assertEqual(self.count_waitlist(1), 1)
+
+        self.login("aldair@kbtu.kz")
+        resp = self.client.post(
+            "/admin/session/delete", data={"session_id": "1"}, follow_redirects=True
+        )
+        self.assertIn(b"Training deleted: Yoga", resp.data)
+        self.assertEqual(self.count_waitlist(1), 0)
+
+    def test_38_waitlist_routes_enforce_csrf(self):
+        self.login("adil@kbtu.kz")
+        app.app.config["ENFORCE_CSRF_IN_TESTS"] = True
+        try:
+            # Missing token -> 400
+            bad_join = self.client.post("/waitlist/join", data={"session_id": "1"})
+            self.assertEqual(bad_join.status_code, 400)
+            bad_leave = self.client.post("/waitlist/leave", data={"session_id": "1"})
+            self.assertEqual(bad_leave.status_code, 400)
+
+            # Valid token from home page -> succeeds
+            home = self.client.get("/")
+            match = re.search(rb'name="csrf_token" value="([0-9a-f]+)"', home.data)
+            self.assertIsNotNone(match)
+            token = match.group(1).decode()
+            good_join = self.client.post(
+                "/waitlist/join",
+                data={"csrf_token": token, "session_id": "1"},
+                follow_redirects=True,
+            )
+            self.assertIn(b"Joined waitlist for Yoga", good_join.data)
+            good_leave = self.client.post(
+                "/waitlist/leave",
+                data={"csrf_token": token, "session_id": "1"},
+                follow_redirects=True,
+            )
+            self.assertIn(b"Left waitlist: Yoga", good_leave.data)
+        finally:
+            app.app.config["ENFORCE_CSRF_IN_TESTS"] = False
+
+    def test_39_capacity_increase_auto_promotes_waitlist_via_http(self):
+        self.login("adil@kbtu.kz")
+        self.client.post("/waitlist/join", data={"session_id": "1"})
+        self.assertEqual(self.count_waitlist(1, 3), 1)
+
+        self.login("aldair@kbtu.kz")
+        resp = self.client.post(
+            "/admin/session/update",
+            data={
+                "session_id": "1",
+                "title": "Yoga",
+                "trainer": "Aigerim",
+                "session_date": self.future_date,
+                "start_time": "10:00",
+                "capacity": "3",
+                "price": "15.00",
+            },
+            follow_redirects=True,
+        )
+        self.assertIn(b"Waitlist auto-promoted: Adil", resp.data)
+        self.assertEqual(self.count_bookings(3, 1), 1)
+        self.assertEqual(self.count_waitlist(1, 3), 0)
+        self.assertEqual(self.balance_of(3), 85.0)
+
+
+class ConcurrencyTests(unittest.TestCase):
+    """15 multithreaded race-condition tests using threading.Thread + threading.Barrier.
+    Every test runs on its own isolated temporary file-backed SQLite DB in WAL mode.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_db = app.DB
+        self.db_path = os.path.join(self.temp_dir.name, "conc_gym.db")
+        app.DB = self.db_path
+        app.app.config.update(TESTING=True)
+        app.init_db(extended=False)
+
+    def tearDown(self):
+        app._initialized_dbs.discard(self.db_path)
+        app.DB = self.original_db
+        self.temp_dir.cleanup()
+
+    def connect(self):
+        return app.connect_db(self.db_path)
+
+    def add_member(self, conn, idx, balance=100.0, status="active"):
+        cur = conn.execute(
+            "INSERT INTO Members(name,email,membership_status,password_hash,role,balance) "
+            "VALUES (?,?,?,?,?,?)",
+            (f"ThreadUser {idx}", f"tuser{idx}@kbtu.kz", status, app.DEMO_PW_HASH, "member", balance),
+        )
+        return cur.lastrowid
+
+    def add_session(self, conn, title, capacity, price=15.0, days_ahead=5):
+        cur = conn.execute(
+            "INSERT INTO Sessions(title,trainer,session_date,start_time,capacity,price) "
+            "VALUES (?,?,?,?,?,?)",
+            (title, "Coach", app.day(days_ahead), "12:00", capacity, price),
+        )
+        return cur.lastrowid
+
+    def run_barrier(self, callables):
+        barrier = threading.Barrier(len(callables))
+        results = [None] * len(callables)
+        errors = []
+        lock = threading.Lock()
+
+        def worker(i, fn):
+            try:
+                results[i] = fn(barrier)
+            except Exception as exc:
+                with lock:
+                    errors.append((i, type(exc).__name__, str(exc)))
+
+        threads = [threading.Thread(target=worker, args=(i, fn)) for i, fn in enumerate(callables)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [], f"Unexpected thread errors: {errors}")
+        return results
+
+    def test_conc_01_last_seat_race_condition(self):
+        with closing(self.connect()) as db:
+            with db:
+                mids = [self.add_member(db, i, 100.0) for i in range(10)]
+                sid = self.add_session(db, "Last Seat", 1, 15.0)
+
+        def make_task(mid):
+            def task(barrier):
+                with closing(self.connect()) as conn:
+                    barrier.wait()
+                    return app.book_session(conn, mid, sid)
+            return task
+
+        res = self.run_barrier([make_task(m) for m in mids])
+        self.assertEqual(sum(1 for ok, _ in res if ok), 1)
+        self.assertEqual(sum(1 for ok, _ in res if not ok), 9)
+        with closing(self.connect()) as db:
+            self.assertEqual(app.taken_of(db, sid), 1)
+            paid = db.execute(
+                "SELECT COUNT(*) FROM Payments WHERE session_id=? AND status='paid'", (sid,)
+            ).fetchone()[0]
+            self.assertEqual(paid, 1)
+            bals = [app.balance_of(db, m) for m in mids]
+            self.assertEqual(bals.count(85.0), 1)
+            self.assertEqual(bals.count(100.0), 9)
+
+    def test_conc_02_multi_seat_exact_capacity_race(self):
+        with closing(self.connect()) as db:
+            with db:
+                mids = [self.add_member(db, i, 100.0) for i in range(12)]
+                sid = self.add_session(db, "Three Seats", 3, 20.0)
+
+        def make_task(mid):
+            def task(barrier):
+                with closing(self.connect()) as conn:
+                    barrier.wait()
+                    return app.book_session(conn, mid, sid)
+            return task
+
+        res = self.run_barrier([make_task(m) for m in mids])
+        self.assertEqual(sum(1 for ok, _ in res if ok), 3)
+        self.assertEqual(sum(1 for ok, _ in res if not ok), 9)
+        with closing(self.connect()) as db:
+            self.assertEqual(app.taken_of(db, sid), 3)
+            paid = db.execute(
+                "SELECT COUNT(*) FROM Payments WHERE session_id=? AND status='paid'", (sid,)
+            ).fetchone()[0]
+            self.assertEqual(paid, 3)
+
+    def test_conc_03_same_user_double_book_race(self):
+        with closing(self.connect()) as db:
+            with db:
+                sid = self.add_session(db, "Double Book", 5, 20.0)
+
+        def task(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.book_session(conn, 3, sid)
+
+        res = self.run_barrier([task for _ in range(5)])
+        self.assertEqual(sum(1 for ok, _ in res if ok), 1)
+        self.assertEqual(sum(1 for ok, _ in res if not ok), 4)
+        with closing(self.connect()) as db:
+            self.assertEqual(app.taken_of(db, sid), 1)
+            self.assertEqual(app.balance_of(db, 3), 80.0)
+
+    def test_conc_04_double_cancel_double_refund_race(self):
+        with closing(self.connect()) as db:
+            self.assertTrue(app.book_session(db, 3, 2)[0])  # Boxing $20
+            bid = app.booking_id_of(db, 3, 2)
+
+        def task(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.cancel_booking(conn, 3, bid)
+
+        res = self.run_barrier([task for _ in range(5)])
+        self.assertEqual(sum(1 for ok, _ in res if ok), 1)
+        self.assertEqual(sum(1 for ok, _ in res if not ok), 4)
+        with closing(self.connect()) as db:
+            self.assertEqual(app.taken_of(db, 2), 0)
+            self.assertEqual(app.balance_of(db, 3), 100.0)
+            refunds = db.execute(
+                "SELECT COUNT(*) FROM Payments WHERE member_id=3 AND status='refunded'"
+            ).fetchone()[0]
+            self.assertEqual(refunds, 1)
+
+    def test_conc_05_concurrent_booking_insufficient_balance_race(self):
+        with closing(self.connect()) as db:
+            with db:
+                db.execute("UPDATE Members SET balance=10.0 WHERE member_id=3")
+                sids = [self.add_session(db, f"Budget {i}", 5, 10.0) for i in range(3)]
+
+        def make_task(sid):
+            def task(barrier):
+                with closing(self.connect()) as conn:
+                    barrier.wait()
+                    return app.book_session(conn, 3, sid)
+            return task
+
+        res = self.run_barrier([make_task(s) for s in sids])
+        self.assertEqual(sum(1 for ok, _ in res if ok), 1)
+        self.assertEqual(sum(1 for ok, _ in res if not ok), 2)
+        with closing(self.connect()) as db:
+            bal = app.balance_of(db, 3)
+            self.assertGreaterEqual(bal, 0.0)
+            self.assertEqual(bal, 0.0)
+            count = db.execute("SELECT COUNT(*) FROM Bookings WHERE member_id=3").fetchone()[0]
+            self.assertEqual(count, 1)
+
+    def test_conc_06_concurrent_topup_race(self):
+        def task(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.topup_balance(conn, 3, 10.0)
+
+        res = self.run_barrier([task for _ in range(10)])
+        self.assertTrue(all(ok for ok, _ in res))
+        with closing(self.connect()) as db:
+            self.assertEqual(app.balance_of(db, 3), 200.0)
+
+    def test_conc_07_concurrent_waitlist_join_same_user(self):
+        def task(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.join_waitlist(conn, 3, 1)  # Full Yoga session
+
+        res = self.run_barrier([task for _ in range(5)])
+        self.assertEqual(sum(1 for ok, _ in res if ok), 1)
+        self.assertEqual(sum(1 for ok, _ in res if not ok), 4)
+        with closing(self.connect()) as db:
+            cnt = db.execute(
+                "SELECT COUNT(*) FROM Waitlist WHERE member_id=3 AND session_id=1"
+            ).fetchone()[0]
+            self.assertEqual(cnt, 1)
+
+    def test_conc_08_concurrent_waitlist_join_multiple_users_fifo(self):
+        with closing(self.connect()) as db:
+            with db:
+                mids = [self.add_member(db, i, 100.0) for i in range(8)]
+
+        def make_task(mid):
+            def task(barrier):
+                with closing(self.connect()) as conn:
+                    barrier.wait()
+                    return app.join_waitlist(conn, mid, 1)
+            return task
+
+        res = self.run_barrier([make_task(m) for m in mids])
+        self.assertTrue(all(ok for ok, _ in res))
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                "SELECT waitlist_id, member_id FROM Waitlist WHERE session_id=1 "
+                "ORDER BY created_at ASC, waitlist_id ASC"
+            ).fetchall()
+            self.assertEqual(len(rows), 8)
+            self.assertEqual(len({r["member_id"] for r in rows}), 8)
+            wids = [r["waitlist_id"] for r in rows]
+            self.assertEqual(wids, sorted(wids))
+
+    def test_conc_09_concurrent_cancel_and_waitlist_auto_promotion(self):
+        with closing(self.connect()) as db:
+            with db:
+                sid = self.add_session(db, "Dual Cancel", 2, 15.0)
+                a = self.add_member(db, 1, 100.0)
+                b = self.add_member(db, 2, 100.0)
+                w = [self.add_member(db, i, 100.0) for i in range(3, 7)]
+            self.assertTrue(app.book_session(db, a, sid)[0])
+            self.assertTrue(app.book_session(db, b, sid)[0])
+            ba, bb = app.booking_id_of(db, a, sid), app.booking_id_of(db, b, sid)
+            for wm in w:
+                self.assertTrue(app.join_waitlist(db, wm, sid)[0])
+
+        def make_cancel(mid, bid):
+            def task(barrier):
+                with closing(self.connect()) as conn:
+                    barrier.wait()
+                    return app.cancel_booking(conn, mid, bid)
+            return task
+
+        res = self.run_barrier([make_cancel(a, ba), make_cancel(b, bb)])
+        self.assertTrue(all(ok for ok, _ in res))
+        with closing(self.connect()) as db:
+            self.assertEqual(app.taken_of(db, sid), 2)
+            booked = {
+                r[0] for r in db.execute(
+                    "SELECT member_id FROM Bookings WHERE session_id=? AND status='confirmed'",
+                    (sid,),
+                )
+            }
+            self.assertEqual(booked, {w[0], w[1]})
+            remaining = [
+                r[0] for r in db.execute(
+                    "SELECT member_id FROM Waitlist WHERE session_id=? "
+                    "ORDER BY created_at ASC, waitlist_id ASC",
+                    (sid,),
+                )
+            ]
+            self.assertEqual(remaining, [w[2], w[3]])
+            self.assertEqual(app.balance_of(db, a), 100.0)
+            self.assertEqual(app.balance_of(db, b), 100.0)
+            self.assertEqual(app.balance_of(db, w[0]), 85.0)
+            self.assertEqual(app.balance_of(db, w[1]), 85.0)
+
+    def test_conc_10_concurrent_cancel_and_direct_booking_vs_waitlist(self):
+        with closing(self.connect()) as db:
+            with db:
+                sid = self.add_session(db, "Cancel vs Direct", 1, 15.0)
+                owner = self.add_member(db, 1, 100.0)
+                waiter = self.add_member(db, 2, 100.0)
+                outsider = self.add_member(db, 3, 100.0)
+            self.assertTrue(app.book_session(db, owner, sid)[0])
+            bid = app.booking_id_of(db, owner, sid)
+            self.assertTrue(app.join_waitlist(db, waiter, sid)[0])
+
+        def do_cancel(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.cancel_booking(conn, owner, bid)
+
+        def do_book(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.book_session(conn, outsider, sid)
+
+        res = self.run_barrier([do_cancel, do_book])
+        self.assertTrue(res[0][0])
+        self.assertFalse(res[1][0])
+        with closing(self.connect()) as db:
+            self.assertEqual(app.taken_of(db, sid), 1)
+            self.assertEqual(app.balance_of(db, owner), 100.0)
+            self.assertEqual(app.balance_of(db, waiter), 85.0)
+            self.assertEqual(app.balance_of(db, outsider), 100.0)
+
+    def test_conc_11_concurrent_waitlist_leave_and_cancel_auto_promote(self):
+        with closing(self.connect()) as db:
+            with db:
+                sid = self.add_session(db, "Leave vs Cancel", 1, 15.0)
+                owner = self.add_member(db, 1, 100.0)
+                w1 = self.add_member(db, 2, 100.0)
+                w2 = self.add_member(db, 3, 100.0)
+            self.assertTrue(app.book_session(db, owner, sid)[0])
+            bid = app.booking_id_of(db, owner, sid)
+            self.assertTrue(app.join_waitlist(db, w1, sid)[0])
+            self.assertTrue(app.join_waitlist(db, w2, sid)[0])
+
+        def do_leave(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.leave_waitlist(conn, w1, sid)
+
+        def do_cancel(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.cancel_booking(conn, owner, bid)
+
+        res = self.run_barrier([do_leave, do_cancel])
+        self.assertTrue(res[1][0])
+        with closing(self.connect()) as db:
+            self.assertEqual(app.taken_of(db, sid), 1)
+            self.assertEqual(app.balance_of(db, owner), 100.0)
+            booked_id = db.execute(
+                "SELECT member_id FROM Bookings WHERE session_id=?", (sid,)
+            ).fetchone()[0]
+            self.assertIn(booked_id, (w1, w2))
+            other = w2 if booked_id == w1 else w1
+            self.assertEqual(app.balance_of(db, booked_id), 85.0)
+            self.assertEqual(app.balance_of(db, other), 100.0)
+            overlap = db.execute(
+                "SELECT COUNT(*) FROM Bookings b JOIN Waitlist w "
+                "ON b.member_id=w.member_id AND b.session_id=w.session_id WHERE b.session_id=?",
+                (sid,),
+            ).fetchone()[0]
+            self.assertEqual(overlap, 0)
+
+    def test_conc_12_concurrent_admin_capacity_reduction_vs_booking(self):
+        d5 = app.day(5)
+        with closing(self.connect()) as db:
+            with db:
+                sid = self.add_session(db, "Capacity Race", 5, 10.0, days_ahead=5)
+                starter = self.add_member(db, 0, 100.0)
+                mids = [self.add_member(db, i, 100.0) for i in range(1, 6)]
+            self.assertTrue(app.book_session(db, starter, sid)[0])
+
+        def do_reduce(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.update_session(conn, sid, "Capacity Race", "Coach", d5, "12:00", 2, 10.0)
+
+        def make_book(mid):
+            def task(barrier):
+                with closing(self.connect()) as conn:
+                    barrier.wait()
+                    return app.book_session(conn, mid, sid)
+            return task
+
+        res = self.run_barrier([do_reduce] + [make_book(m) for m in mids])
+        admin_ok = res[0][0]
+        booked_new = sum(1 for ok, _ in res[1:] if ok)
+        with closing(self.connect()) as db:
+            cap = db.execute("SELECT capacity FROM Sessions WHERE session_id=?", (sid,)).fetchone()[0]
+            taken = app.taken_of(db, sid)
+            self.assertLessEqual(taken, cap)
+            self.assertEqual(taken, 1 + booked_new)
+            if admin_ok:
+                self.assertEqual(cap, 2)
+            else:
+                self.assertEqual(cap, 5)
+                self.assertGreater(taken, 2)
+
+    def test_conc_13_concurrent_failed_login_bruteforce_lockout(self):
+        def task(barrier):
+            with closing(self.connect()) as conn:
+                barrier.wait()
+                return app.authenticate_with_status(conn, "adil@kbtu.kz", "wrongpw")
+
+        res = self.run_barrier([task for _ in range(8)])
+        self.assertTrue(all(m is None for m, _ in res))
+        self.assertTrue(any("locked" in (err or "").lower() for _, err in res))
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT failed_attempts, locked_until FROM Members WHERE member_id=3"
+            ).fetchone()
+            self.assertEqual(row["failed_attempts"], app.MAX_LOGIN_ATTEMPTS)
+            self.assertIsNotNone(row["locked_until"])
+            self.assertGreater(datetime.fromisoformat(row["locked_until"]), datetime.now())
+            m_ok, err_ok = app.authenticate_with_status(db, "adil@kbtu.kz", "1234")
+            self.assertIsNone(m_ok)
+            self.assertIn("locked", (err_ok or "").lower())
+
+    def test_conc_14_concurrent_password_reset_token_reuse_http(self):
+        with closing(self.connect()) as db:
+            ok, token, _ = app.create_password_reset(db, "adil@kbtu.kz")
+            self.assertTrue(ok)
+
+        def make_task(idx):
+            def task(barrier):
+                client = app.app.test_client()
+                barrier.wait()
+                resp = client.post(
+                    f"/reset-password/{token}",
+                    data={"password": f"racepass{idx}"},
+                    follow_redirects=True,
+                )
+                return b"Password updated successfully" in resp.data
+            return task
+
+        res = self.run_barrier([make_task(i) for i in range(5)])
+        self.assertEqual(sum(1 for ok in res if ok), 1)
+        self.assertEqual(sum(1 for ok in res if not ok), 4)
+        winner_idx = res.index(True)
+        with closing(self.connect()) as db:
+            used = db.execute(
+                "SELECT used FROM PasswordResets WHERE token=?", (token,)
+            ).fetchone()[0]
+            self.assertEqual(used, 1)
+            self.assertIsNotNone(app.authenticate(db, "adil@kbtu.kz", f"racepass{winner_idx}"))
+
+    def test_conc_15_waitlist_auto_promote_skips_ineligible_under_concurrency(self):
+        with closing(self.connect()) as db:
+            with db:
+                sid = self.add_session(db, "Skip Ineligible", 2, 20.0)
+                a = self.add_member(db, 1, 100.0)
+                b = self.add_member(db, 2, 100.0)
+                w_poor = self.add_member(db, 3, 5.0, "active")
+                w_exp = self.add_member(db, 4, 100.0, "active")
+                w_ok1 = self.add_member(db, 5, 100.0, "active")
+                w_ok2 = self.add_member(db, 6, 100.0, "active")
+            self.assertTrue(app.book_session(db, a, sid)[0])
+            self.assertTrue(app.book_session(db, b, sid)[0])
+            ba, bb = app.booking_id_of(db, a, sid), app.booking_id_of(db, b, sid)
+            for wm in (w_poor, w_exp, w_ok1, w_ok2):
+                self.assertTrue(app.join_waitlist(db, wm, sid)[0])
+            with db:
+                db.execute("UPDATE Members SET membership_status='expired' WHERE member_id=?", (w_exp,))
+
+        def make_cancel(mid, bid):
+            def task(barrier):
+                with closing(self.connect()) as conn:
+                    barrier.wait()
+                    return app.cancel_booking(conn, mid, bid)
+            return task
+
+        res = self.run_barrier([make_cancel(a, ba), make_cancel(b, bb)])
+        self.assertTrue(all(ok for ok, _ in res))
+        with closing(self.connect()) as db:
+            self.assertEqual(app.taken_of(db, sid), 2)
+            booked = {
+                r[0] for r in db.execute(
+                    "SELECT member_id FROM Bookings WHERE session_id=? AND status='confirmed'",
+                    (sid,),
+                )
+            }
+            self.assertEqual(booked, {w_ok1, w_ok2})
+            self.assertEqual(app.balance_of(db, w_poor), 5.0)
+            self.assertEqual(app.balance_of(db, w_exp), 100.0)
+            self.assertEqual(app.balance_of(db, w_ok1), 80.0)
+            self.assertEqual(app.balance_of(db, w_ok2), 80.0)
+            self.assertEqual(app.balance_of(db, a), 100.0)
+            self.assertEqual(app.balance_of(db, b), 100.0)
+            rem = [
+                r[0] for r in db.execute(
+                    "SELECT member_id FROM Waitlist WHERE session_id=? "
+                    "ORDER BY created_at ASC, waitlist_id ASC",
+                    (sid,),
+                )
+            ]
+            self.assertEqual(rem, [w_poor, w_exp])
 
 
 if __name__ == "__main__":
