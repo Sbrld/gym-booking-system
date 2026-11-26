@@ -34,7 +34,9 @@ import re
 import secrets
 import sqlite3
 import sys     # ADDED (Iskander)
+import tempfile
 import threading
+from contextlib import closing
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import (Flask, abort, g, render_template_string, request, redirect,
@@ -53,6 +55,7 @@ LOCKOUT_MINUTES = 15
 RESET_TOKEN_MINUTES = 30
 DEFAULT_MEMBER_BALANCE = 100.0
 DEFAULT_SESSION_PRICE = 10.0
+DB_TIMEOUT = 15.0
 
 _initialized_dbs = set()
 _init_lock = threading.Lock()
@@ -115,6 +118,13 @@ CREATE TABLE IF NOT EXISTS AuditLog (
     action TEXT NOT NULL CHECK (action LIKE '%.%'),   -- 'kind.what', e.g. session.create
     target TEXT NOT NULL DEFAULT '',
     details TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS Waitlist (
+    waitlist_id INTEGER PRIMARY KEY,
+    member_id INTEGER NOT NULL REFERENCES Members(member_id) ON DELETE CASCADE,
+    session_id INTEGER NOT NULL REFERENCES Sessions(session_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    UNIQUE (member_id, session_id)
 );
 -- the log is append-only: the database itself refuses to change or delete a row
 CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON AuditLog
@@ -187,11 +197,23 @@ EXT_START_BALANCE = 800.0  # money of every demo member before the demo bookings
 # =====================================================================
 # DATABASE HELPERS (base app; DONE BY: Iskander - SEED_* data, foreign keys, extended demo data, schema check)
 # =====================================================================
+def connect_db(path=None, timeout=DB_TIMEOUT):
+    """Open a SQLite connection hardened for concurrent multithreaded access."""
+    target = DB if path is None else path
+    conn = sqlite3.connect(target, timeout=timeout)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+    if target != ":memory:":
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if mode.lower() != "wal":
+            conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")  # ADDED (Iskander)
+        g.db = connect_db(DB)
     return g.db
 
 
@@ -211,6 +233,7 @@ def seed_db(db, extended=False):
     """Create tables, apply idempotent migrations, and seed demo data (only if empty).
     Works for gym.db and for the in-memory databases used by the tests."""
     db.execute("PRAGMA foreign_keys = ON")  # ADDED (Iskander): also for the in-memory test databases
+    db.execute(f"PRAGMA busy_timeout = {int(DB_TIMEOUT * 1000)}")
     db.executescript(SCHEMA)
 
     # Idempotent migrations for older gym.db files
@@ -308,10 +331,12 @@ def seed_extended(db):
                f"Loaded {len(ext_ids)} members, {counts['sessions']} sessions, {counts['bookings']} bookings")
 
 
-def init_db():
-    db = sqlite3.connect(DB)
+def init_db(extended=None):
+    if extended is None:
+        extended = not app.config.get("TESTING", False)
+    db = connect_db(DB)
     try:
-        seed_db(db, extended=True)  # CHANGED (Iskander): bigger demo data for the real gym.db
+        seed_db(db, extended=extended)  # CHANGED (Iskander): bigger demo data for the real gym.db
     finally:
         db.close()
     _initialized_dbs.add(DB)
@@ -345,12 +370,15 @@ EXPECTED_SCHEMA = {  # table -> {column: (type, NOT NULL)}
     "AuditLog": {"log_id": ("INTEGER", 0), "created_at": ("TEXT", 1), "actor_id": ("INTEGER", 0),
                  "actor_name": ("TEXT", 1), "action": ("TEXT", 1), "target": ("TEXT", 1),
                  "details": ("TEXT", 1)},
+    "Waitlist": {"waitlist_id": ("INTEGER", 0), "member_id": ("INTEGER", 1),
+                 "session_id": ("INTEGER", 1), "created_at": ("TEXT", 1)},
 }
 EXPECTED_FKS = {  # table -> {(parent table, column, on delete)}
     "Bookings": {("Members", "member_id", "CASCADE"), ("Sessions", "session_id", "CASCADE")},
     "Payments": {("Members", "member_id", "CASCADE")},  # no FK to Sessions: payment history survives
     "PasswordResets": {("Members", "member_id", "CASCADE")},
     "AuditLog": set(),                                  # no FKs: the log survives deleting anything
+    "Waitlist": {("Members", "member_id", "CASCADE"), ("Sessions", "session_id", "CASCADE")},
 }
 # bad rows that the database itself must reject (CHECK constraints)
 BAD_ROWS = [
@@ -384,8 +412,7 @@ def check_schema():
         if not cond:
             problems.append(bad)
 
-    db = sqlite3.connect(DB)
-    db.execute("PRAGMA foreign_keys = ON")
+    db = connect_db(DB)
     hint = " (old gym.db? run: python app.py --reset)"
     # 1. tables, columns, types
     for table, cols in EXPECTED_SCHEMA.items():
@@ -399,6 +426,10 @@ def check_schema():
             for i in db.execute("PRAGMA index_list(Bookings)")]
     check(["member_id", "session_id"] in uniq, "Bookings: UNIQUE(member_id, session_id)",
           "Bookings: UNIQUE(member_id, session_id) is missing")
+    w_uniq = [[c[2] for c in db.execute(f"PRAGMA index_info({i[1]})")]
+              for i in db.execute("PRAGMA index_list(Waitlist)")]
+    check(["member_id", "session_id"] in w_uniq, "Waitlist: UNIQUE(member_id, session_id)",
+          "Waitlist: UNIQUE(member_id, session_id) is missing")
     for table, expected in EXPECTED_FKS.items():
         fks = {(r[2], r[3], r[6]) for r in db.execute(f"PRAGMA foreign_key_list({table})")}
         check(fks == expected, f"foreign keys of {table}: {sorted(expected) or 'none'}",
@@ -517,6 +548,7 @@ def admin_required(f):
 
 def authenticate_with_status(db, email, password):
     """Authenticate email+password with 5-attempt / 15-minute lockout enforcement.
+    Uses BEGIN IMMEDIATE for atomic attempt counting and lockout under concurrency.
     Returns (member_row | None, error_message | None)."""
     norm_email = (email or "").strip().lower()
     m = db.execute("SELECT * FROM Members WHERE email=?", (norm_email,)).fetchone()
@@ -535,27 +567,60 @@ def authenticate_with_status(db, email, password):
             return None, (f"Account is locked due to too many failed login attempts. "
                           f"Try again in {mins_left} minute(s).")
 
-    if m["password_hash"] and check_password_hash(m["password_hash"], password or ""):
-        if (m["failed_attempts"] or 0) > 0 or m["locked_until"]:
-            with db:
+    # Verify password outside the write lock (scrypt hashing is CPU-intensive)
+    pw_ok = bool(m["password_hash"] and check_password_hash(m["password_hash"], password or ""))
+
+    started_tx = not db.in_transaction
+    if started_tx:
+        db.execute("BEGIN IMMEDIATE")
+    try:
+        cur = db.execute("SELECT * FROM Members WHERE member_id=?", (m["member_id"],)).fetchone()
+        if cur is None:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return None, "Wrong email or password."
+
+        now = datetime.now()
+        if cur["locked_until"]:
+            try:
+                lock_dt = datetime.fromisoformat(cur["locked_until"])
+            except ValueError:
+                lock_dt = None
+            if lock_dt and lock_dt > now:
+                if started_tx and db.in_transaction:
+                    db.rollback()
+                mins_left = max(1, math.ceil((lock_dt - now).total_seconds() / 60))
+                return None, (f"Account is locked due to too many failed login attempts. "
+                              f"Try again in {mins_left} minute(s).")
+
+        if pw_ok:
+            if (cur["failed_attempts"] or 0) > 0 or cur["locked_until"]:
                 db.execute("UPDATE Members SET failed_attempts=0, locked_until=NULL WHERE member_id=?",
-                           (m["member_id"],))
-            m = db.execute("SELECT * FROM Members WHERE member_id=?", (m["member_id"],)).fetchone()
-        return m, None
+                           (cur["member_id"],))
+                cur = db.execute("SELECT * FROM Members WHERE member_id=?", (cur["member_id"],)).fetchone()
+            if started_tx:
+                db.commit()
+            return cur, None
 
-    attempts = (m["failed_attempts"] or 0) + 1
-    if attempts >= MAX_LOGIN_ATTEMPTS:
-        until = (now + timedelta(minutes=LOCKOUT_MINUTES)).isoformat(timespec="seconds")
-        with db:
+        attempts = (cur["failed_attempts"] or 0) + 1
+        if attempts >= MAX_LOGIN_ATTEMPTS:
+            until = (now + timedelta(minutes=LOCKOUT_MINUTES)).isoformat(timespec="seconds")
             db.execute("UPDATE Members SET failed_attempts=?, locked_until=? WHERE member_id=?",
-                       (attempts, until, m["member_id"]))
-        return None, (f"Too many failed login attempts. Account locked for "
-                      f"{LOCKOUT_MINUTES} minutes.")
+                       (attempts, until, cur["member_id"]))
+            if started_tx:
+                db.commit()
+            return None, (f"Too many failed login attempts. Account locked for "
+                          f"{LOCKOUT_MINUTES} minutes.")
 
-    with db:
         db.execute("UPDATE Members SET failed_attempts=? WHERE member_id=?",
-                   (attempts, m["member_id"]))
-    return None, "Wrong email or password."
+                   (attempts, cur["member_id"]))
+        if started_tx:
+            db.commit()
+        return None, "Wrong email or password."
+    except Exception:
+        if started_tx and db.in_transaction:
+            db.rollback()
+        raise
 
 
 def authenticate(db, email, password):
@@ -697,31 +762,65 @@ def create_session(db, title, trainer, date, time, capacity, price=DEFAULT_SESSI
 
 
 def update_session(db, session_id, title, trainer, date, time, capacity, price=None):
-    existing = db.execute("SELECT price FROM Sessions WHERE session_id=?", (session_id,)).fetchone()
-    if existing is None:
-        return False, "Training not found."
-    effective_price = existing["price"] if price in (None, "") else price
-    fields, err = _check_session_fields(title, trainer, date, time, capacity, effective_price)
-    if err:
-        return False, err
-    taken = db.execute("SELECT COUNT(*) FROM Bookings WHERE session_id=? AND status='confirmed'",
-                       (session_id,)).fetchone()[0]
-    if fields[4] < taken:
-        return False, f"Capacity cannot be lower than the {taken} bookings already confirmed."
-    with db:
+    started_tx = not db.in_transaction
+    if started_tx:
+        db.execute("BEGIN IMMEDIATE")
+    try:
+        existing = db.execute("SELECT capacity, price FROM Sessions WHERE session_id=?",
+                              (session_id,)).fetchone()
+        if existing is None:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "Training not found."
+        effective_price = existing["price"] if price in (None, "") else price
+        fields, err = _check_session_fields(title, trainer, date, time, capacity, effective_price)
+        if err:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, err
+        taken = db.execute("SELECT COUNT(*) FROM Bookings WHERE session_id=? AND status='confirmed'",
+                           (session_id,)).fetchone()[0]
+        if fields[4] < taken:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, f"Capacity cannot be lower than the {taken} bookings already confirmed."
         db.execute(
             "UPDATE Sessions SET title=?, trainer=?, session_date=?, start_time=?, capacity=?, price=? "
             "WHERE session_id=?", fields + (session_id,))
-    return True, f"Training updated: {fields[0]}."
+        promoted = []
+        if fields[4] > existing["capacity"]:
+            promoted = _promote_waitlist_in_tx(db, session_id)
+        if started_tx:
+            db.commit()
+    except Exception:
+        if started_tx and db.in_transaction:
+            db.rollback()
+        raise
+    promo_note = ""
+    if promoted:
+        promo_note = f" Waitlist auto-promoted: {', '.join(p['name'] for p in promoted)}."
+    return True, f"Training updated: {fields[0]}.{promo_note}"
 
 
 def delete_session(db, session_id):
-    row = db.execute("SELECT title FROM Sessions WHERE session_id=?", (session_id,)).fetchone()
-    if row is None:
-        return False, "Training not found."
-    with db:  # one transaction: bookings of this training + the training itself
+    started_tx = not db.in_transaction
+    if started_tx:
+        db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("SELECT title FROM Sessions WHERE session_id=?", (session_id,)).fetchone()
+        if row is None:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "Training not found."
+        db.execute("DELETE FROM Waitlist WHERE session_id=?", (session_id,))
         db.execute("DELETE FROM Bookings WHERE session_id=?", (session_id,))
         db.execute("DELETE FROM Sessions WHERE session_id=?", (session_id,))
+        if started_tx:
+            db.commit()
+    except Exception:
+        if started_tx and db.in_transaction:
+            db.rollback()
+        raise
     return True, f"Training deleted: {row['title']} (and its bookings)."
 
 
@@ -778,7 +877,7 @@ def toggle_member_role(db, actor_member_id, target_member_id):
 # PAYMENTS & BALANCE HELPERS (Sprint 3)
 # =====================================================================
 def topup_balance(db, member_id, amount):
-    """Add funds to a member's balance. Returns (ok, message)."""
+    """Add funds to a member's balance atomically. Returns (ok, message)."""
     try:
         val = float(amount)
     except (ValueError, TypeError):
@@ -788,13 +887,24 @@ def topup_balance(db, member_id, amount):
     if val > 10000:
         return False, "Top-up amount cannot exceed $10,000 at once."
     val = round(val, 2)
-    m = db.execute("SELECT balance FROM Members WHERE member_id=?", (member_id,)).fetchone()
-    if m is None:
-        return False, "Member not found."
-    with db:
+    started_tx = not db.in_transaction
+    if started_tx:
+        db.execute("BEGIN IMMEDIATE")
+    try:
+        m = db.execute("SELECT balance FROM Members WHERE member_id=?", (member_id,)).fetchone()
+        if m is None:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "Member not found."
         db.execute("UPDATE Members SET balance = ROUND(balance + ?, 2) WHERE member_id=?",
                    (val, member_id))
-    new_balance = db.execute("SELECT balance FROM Members WHERE member_id=?", (member_id,)).fetchone()[0]
+        new_balance = db.execute("SELECT balance FROM Members WHERE member_id=?", (member_id,)).fetchone()[0]
+        if started_tx:
+            db.commit()
+    except Exception:
+        if started_tx and db.in_transaction:
+            db.rollback()
+        raise
     return True, f"Balance topped up by ${val:.2f}. New balance: ${new_balance:.2f}."
 
 
@@ -899,6 +1009,8 @@ def book_session(db, member_id, session_id):
         db.execute(
             "INSERT INTO Payments(member_id,session_id,amount,status,created_at) VALUES (?,?,?,?,?)",
             (member_id, session_id, price, "paid", now))
+        db.execute("DELETE FROM Waitlist WHERE member_id=? AND session_id=?",
+                   (member_id, session_id))
         if started_tx:
             db.commit()
     except sqlite3.IntegrityError:
@@ -914,9 +1026,215 @@ def book_session(db, member_id, session_id):
 
 
 # =====================================================================
+# WAITLIST SYSTEM (FIFO queue, atomic join/leave, auto-promotion on cancel & capacity increase)
+# Rule for ineligible/low-balance waitlisted members during auto-promotion:
+#   Ineligible (expired) or low-balance members are SKIPPED and KEPT in the waitlist queue
+#   (preserving their FIFO position if they later renew/top up), while the next eligible
+#   member in FIFO order is promoted and charged.
+# =====================================================================
+def _promote_waitlist_in_tx(db, session_id):
+    """Promote eligible FIFO waitlisted members into open spots for an upcoming session.
+    MUST be called inside an active BEGIN IMMEDIATE transaction.
+    Returns list of promoted dicts: [{'member_id', 'name', 'price'}, ...]."""
+    sess = db.execute("SELECT * FROM Sessions WHERE session_id=?", (session_id,)).fetchone()
+    if sess is None or _starts(sess) <= datetime.now():
+        return []
+    taken = db.execute(
+        "SELECT COUNT(*) FROM Bookings WHERE session_id=? AND status='confirmed'",
+        (session_id,)).fetchone()[0]
+    spots = sess["capacity"] - taken
+    if spots <= 0:
+        return []
+
+    price = round(float(sess["price"]), 2)
+    candidates = db.execute("""
+        SELECT w.waitlist_id, w.member_id, m.name, m.membership_status, m.balance
+        FROM Waitlist w
+        JOIN Members m ON m.member_id = w.member_id
+        WHERE w.session_id = ?
+        ORDER BY w.created_at ASC, w.waitlist_id ASC""", (session_id,)).fetchall()
+
+    promoted = []
+    for cand in candidates:
+        if spots <= 0:
+            break
+        already = db.execute(
+            "SELECT 1 FROM Bookings WHERE member_id=? AND session_id=? AND status='confirmed'",
+            (cand["member_id"], session_id)).fetchone()
+        if already:
+            db.execute("DELETE FROM Waitlist WHERE waitlist_id=?", (cand["waitlist_id"],))
+            continue
+        bal = round(float(cand["balance"]), 2)
+        if cand["membership_status"] != "active" or bal < price:
+            # Skip ineligible / low-balance member and keep them in the waitlist queue
+            continue
+
+        now = datetime.now().isoformat(timespec="seconds")
+        db.execute("DELETE FROM Waitlist WHERE waitlist_id=?", (cand["waitlist_id"],))
+        db.execute("UPDATE Members SET balance = ROUND(balance - ?, 2) WHERE member_id=?",
+                   (price, cand["member_id"]))
+        db.execute(
+            "INSERT INTO Bookings(member_id,session_id,status,booked_at) VALUES (?,?,?,?)",
+            (cand["member_id"], session_id, "confirmed", now))
+        db.execute(
+            "INSERT INTO Payments(member_id,session_id,amount,status,created_at) VALUES (?,?,?,?,?)",
+            (cand["member_id"], session_id, price, "paid", now))
+        promoted.append({"member_id": cand["member_id"], "name": cand["name"], "price": price})
+        spots -= 1
+    return promoted
+
+
+def join_waitlist(db, member_id, session_id):
+    """Add an active member to the FIFO waitlist of a full upcoming session (no charge).
+    Returns (ok: bool, message: str)."""
+    started_tx = not db.in_transaction
+    if started_tx:
+        db.execute("BEGIN IMMEDIATE")
+    try:
+        member = db.execute("SELECT * FROM Members WHERE member_id=?", (member_id,)).fetchone()
+        sess = db.execute("SELECT * FROM Sessions WHERE session_id=?", (session_id,)).fetchone()
+        if member is None or sess is None:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "Member or session not found."
+
+        if member["membership_status"] != "active":
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "Your membership has expired. Please renew it to join the waitlist."
+
+        if _starts(sess) <= datetime.now():
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "This session has already started or finished."
+
+        dup_book = db.execute(
+            "SELECT 1 FROM Bookings WHERE member_id=? AND session_id=? AND status='confirmed'",
+            (member_id, session_id)).fetchone()
+        if dup_book:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "You are already registered for this session."
+
+        dup_wait = db.execute(
+            "SELECT 1 FROM Waitlist WHERE member_id=? AND session_id=?",
+            (member_id, session_id)).fetchone()
+        if dup_wait:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "You are already on the waitlist for this session."
+
+        taken = db.execute(
+            "SELECT COUNT(*) FROM Bookings WHERE session_id=? AND status='confirmed'",
+            (session_id,)).fetchone()[0]
+        if taken < sess["capacity"]:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "Spots are still available for this session. Please book directly instead."
+
+        now = datetime.now().isoformat(timespec="seconds")
+        db.execute(
+            "INSERT INTO Waitlist(member_id, session_id, created_at) VALUES (?,?,?)",
+            (member_id, session_id, now))
+        pos = db.execute(
+            "SELECT COUNT(*) FROM Waitlist WHERE session_id=?", (session_id,)).fetchone()[0]
+        if started_tx:
+            db.commit()
+    except sqlite3.IntegrityError:
+        if started_tx and db.in_transaction:
+            db.rollback()
+        return False, "You are already on the waitlist for this session."
+    except Exception:
+        if started_tx and db.in_transaction:
+            db.rollback()
+        raise
+    return True, (f"Joined waitlist for {sess['title']} on {sess['session_date']} "
+                  f"at {sess['start_time']} (Position #{pos}).")
+
+
+def leave_waitlist(db, member_id, session_id, is_admin=False, target_member_id=None):
+    """Remove a member from a session's waitlist.
+    Members can only remove themselves; admins can remove anyone (via target_member_id or member_id).
+    Returns (ok: bool, message: str)."""
+    target = member_id if target_member_id is None else target_member_id
+    if target != member_id and not is_admin:
+        return False, "You can only remove yourself from the waitlist."
+
+    started_tx = not db.in_transaction
+    if started_tx:
+        db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("""
+            SELECT w.waitlist_id, w.member_id, m.name AS member_name,
+                   s.title, s.session_date, s.start_time
+            FROM Waitlist w
+            JOIN Members m ON m.member_id = w.member_id
+            JOIN Sessions s ON s.session_id = w.session_id
+            WHERE w.member_id=? AND w.session_id=?""", (target, session_id)).fetchone()
+        if row is None:
+            if started_tx and db.in_transaction:
+                db.rollback()
+            return False, "Waitlist entry not found."
+        db.execute("DELETE FROM Waitlist WHERE waitlist_id=?", (row["waitlist_id"],))
+        if started_tx:
+            db.commit()
+    except Exception:
+        if started_tx and db.in_transaction:
+            db.rollback()
+        raise
+    if target != member_id:
+        return True, (f"Removed {row['member_name']} from waitlist: {row['title']} "
+                      f"on {row['session_date']} at {row['start_time']}.")
+    return True, (f"Left waitlist: {row['title']} on {row['session_date']} "
+                  f"at {row['start_time']}.")
+
+
+def get_member_waitlist(db, member_id):
+    """Return a member's waitlisted sessions with 1-based FIFO queue position."""
+    rows = db.execute("""
+        SELECT w.waitlist_id, w.session_id, w.created_at,
+               s.title, s.trainer, s.session_date, s.start_time, s.price, s.capacity,
+               (SELECT COUNT(*) FROM Bookings b
+                WHERE b.session_id = s.session_id AND b.status = 'confirmed') AS taken,
+               1 + (SELECT COUNT(*) FROM Waitlist w2
+                    WHERE w2.session_id = w.session_id
+                      AND (w2.created_at < w.created_at
+                           OR (w2.created_at = w.created_at AND w2.waitlist_id < w.waitlist_id))) AS position
+        FROM Waitlist w
+        JOIN Sessions s ON s.session_id = w.session_id
+        WHERE w.member_id = ?
+        ORDER BY s.session_date, s.start_time, w.waitlist_id""", (member_id,)).fetchall()
+    now, result = datetime.now(), []
+    for r in rows:
+        d = dict(r)
+        d["is_past"] = _starts(r) <= now
+        result.append(d)
+    return result
+
+
+def get_all_waitlist_entries(db):
+    """Return all waitlist entries across sessions in FIFO order for the admin dashboard."""
+    rows = db.execute("""
+        SELECT w.waitlist_id, w.member_id, w.session_id, w.created_at,
+               m.name AS member_name, m.email AS member_email,
+               m.membership_status, m.balance,
+               s.title AS session_title, s.session_date, s.start_time, s.price,
+               1 + (SELECT COUNT(*) FROM Waitlist w2
+                    WHERE w2.session_id = w.session_id
+                      AND (w2.created_at < w.created_at
+                           OR (w2.created_at = w.created_at AND w2.waitlist_id < w.waitlist_id))) AS position
+        FROM Waitlist w
+        JOIN Members m ON m.member_id = w.member_id
+        JOIN Sessions s ON s.session_id = w.session_id
+        ORDER BY s.session_date, s.start_time, w.created_at, w.waitlist_id""").fetchall()
+    return [dict(r) for r in rows]
+
+
+# =====================================================================
 # DONE BY: Adil + Sprint 3 Refunds - BOOKING CANCELLATION
 # The Bookings row is DELETED so UNIQUE(member_id, session_id) allows rebooking,
 # while the Payments row is updated to status='refunded' for audit history.
+# Also atomically auto-promotes the next eligible FIFO waitlisted member.
 # =====================================================================
 def cancel_booking(db, member_id, booking_id, is_admin=False):
     started_tx = not db.in_transaction
@@ -956,13 +1274,18 @@ def cancel_booking(db, member_id, booking_id, is_admin=False):
                        (now, payment["payment_id"]))
             refund_note = f" (${amt:.2f} refunded)"
 
+        promoted = _promote_waitlist_in_tx(db, b["session_id"])
+
         if started_tx:
             db.commit()
     except Exception:
         if started_tx and db.in_transaction:
             db.rollback()
         raise
-    return True, f"Cancelled: {b['title']} on {b['session_date']} at {b['start_time']}{refund_note}."
+    promo_note = ""
+    if promoted:
+        promo_note = f" Waitlist auto-promoted: {', '.join(p['name'] for p in promoted)}."
+    return True, f"Cancelled: {b['title']} on {b['session_date']} at {b['start_time']}{refund_note}.{promo_note}"
 
 
 # =====================================================================
@@ -982,8 +1305,11 @@ def _load_meta(taken, capacity):
 def search_sessions(db, query="", only_upcoming=False):
     like = f"%{(query or '').strip()}%"
     rows = db.execute("""
-        SELECT s.*, (SELECT COUNT(*) FROM Bookings b
-                     WHERE b.session_id=s.session_id AND b.status='confirmed') AS taken
+        SELECT s.*,
+               (SELECT COUNT(*) FROM Bookings b
+                WHERE b.session_id=s.session_id AND b.status='confirmed') AS taken,
+               (SELECT COUNT(*) FROM Waitlist w
+                WHERE w.session_id=s.session_id) AS waitlist_count
         FROM Sessions s WHERE s.title LIKE ? OR s.trainer LIKE ?
         ORDER BY session_date, start_time""", (like, like)).fetchall()
     now, result = datetime.now(), []
@@ -1058,7 +1384,7 @@ def get_member_bookings(db, member_id):
 # =====================================================================
 AUDIT_KINDS = {  # action prefix -> name of the filter on the audit page
     "session": "Trainings", "member": "Members", "booking": "Bookings",
-    "auth": "Sign-ins", "security": "Security alerts", "system": "System",
+    "waitlist": "Waitlist", "auth": "Sign-ins", "security": "Security alerts", "system": "System",
 }
 AUDIT_ACTIONS = {  # action -> (human text, badge colour class)
     "session.create": ("Created training", ""),
@@ -1067,6 +1393,7 @@ AUDIT_ACTIONS = {  # action -> (human text, badge colour class)
     "member.status": ("Changed membership", "amber"),
     "member.role": ("Changed role", "amber"),
     "booking.cancel": ("Cancelled a booking", "red"),
+    "waitlist.remove": ("Removed from waitlist", "amber"),
     "auth.admin_login": ("Admin sign-in", "grey"),
     "security.lockout": ("Account locked", "red"),
     "system.seed": ("Demo data loaded", "grey"),
@@ -1173,6 +1500,16 @@ def cancel_booking_audited(db, actor, booking_id, is_admin):
     ok, msg = cancel_booking(db, actor["member_id"], booking_id, is_admin=is_admin)
     if ok and info and info["member_id"] != actor["member_id"]:
         log_action(db, actor, "booking.cancel", info["label"], msg)
+    return ok, msg
+
+
+def leave_waitlist_audited(db, actor, session_id, target_member_id, is_admin):
+    """leave_waitlist + an audit row when an admin removes another member from a waitlist."""
+    target = actor["member_id"] if target_member_id is None else target_member_id
+    ok, msg = leave_waitlist(db, actor["member_id"], session_id,
+                             is_admin=is_admin, target_member_id=target)
+    if ok and is_admin and target != actor["member_id"]:
+        log_action(db, actor, "waitlist.remove", f"member #{target} / session #{session_id}", msg)
     return ok, msg
 
 
@@ -1287,6 +1624,8 @@ G_ADIL = "Adil - cancellation case"
 G_TOREZHAN = "Torezhan - 10 user cases (test as user)"
 G_SPRINT3 = "Sprint 3 - Payments, RBAC, Occupancy & Security (19 cases)"
 G_ISKANDER = "Iskander - database rules, audit log, statistics, club occupancy (22 tests)"  # ADDED (Iskander)
+G_WAITLIST = "Waitlist - functional & edge cases (8 tests)"
+G_CONCURRENCY = "Concurrency - 15 multithreaded race-condition tests"
 TESTS = []
 
 
@@ -2066,6 +2405,618 @@ def club_load_labels():
         ["No bookings", "Low", "Low", "Medium", "Medium", "High", "High"]
 
 
+# ---------- WAITLIST: functional & edge cases (8 tests) ----------
+@case(G_WAITLIST)
+def waitlist_join_full_session_no_charge():
+    """Active member joins waitlist of full session without being charged"""
+    db = fresh_db()
+    before = balance_of(db, 3)
+    ok, msg = join_waitlist(db, 3, 1)  # Yoga (session 1) is full (2/2)
+    assert ok and "position #1" in msg.lower(), msg
+    assert balance_of(db, 3) == before
+    wl = get_member_waitlist(db, 3)
+    assert len(wl) == 1 and wl[0]["session_id"] == 1 and wl[0]["position"] == 1
+
+
+@case(G_WAITLIST)
+def waitlist_rejects_open_session():
+    """Joining waitlist fails when session still has free spots"""
+    db = fresh_db()
+    ok, msg = join_waitlist(db, 3, 2)  # Boxing has 3 free spots
+    assert not ok and "book directly" in msg.lower(), msg
+    assert get_member_waitlist(db, 3) == []
+
+
+@case(G_WAITLIST)
+def waitlist_rejects_past_and_expired_and_booked():
+    """Waitlist rejects past sessions, expired members, and already-booked members"""
+    db = fresh_db()
+    # Past session (fill it first or test directly - past check happens first)
+    ok_past, msg_past = join_waitlist(db, 3, 4)
+    assert not ok_past and "already started" in msg_past.lower(), msg_past
+    # Expired member on full session 1
+    ok_exp, msg_exp = join_waitlist(db, 5, 1)
+    assert not ok_exp and "expired" in msg_exp.lower(), msg_exp
+    # Already-booked member (member 1 is booked on Yoga)
+    ok_dup, msg_dup = join_waitlist(db, 1, 1)
+    assert not ok_dup and "already registered" in msg_dup.lower(), msg_dup
+
+
+@case(G_WAITLIST)
+def waitlist_leave_and_admin_remove():
+    """Member can leave own waitlist; non-admin cannot remove others; admin can"""
+    db = fresh_db()
+    assert join_waitlist(db, 3, 1)[0]
+    assert join_waitlist(db, 4, 1)[0]
+    # Non-admin Adil (3) cannot remove Zhanibek (4)
+    ok_deny, _ = leave_waitlist(db, 3, 1, is_admin=False, target_member_id=4)
+    assert not ok_deny
+    # Adil leaves his own waitlist -> Zhanibek moves to #1
+    assert leave_waitlist(db, 3, 1)[0]
+    wl4 = get_member_waitlist(db, 4)
+    assert len(wl4) == 1 and wl4[0]["position"] == 1
+    # Admin Aldair (1) removes Zhanibek (4)
+    assert leave_waitlist(db, 1, 1, is_admin=True, target_member_id=4)[0]
+    assert get_member_waitlist(db, 4) == []
+
+
+@case(G_WAITLIST)
+def waitlist_auto_promote_fifo_on_cancel():
+    """Cancelling a booking auto-promotes the first FIFO waitlisted member and charges them"""
+    db = fresh_db()
+    assert join_waitlist(db, 3, 1)[0]  # #1 Adil ($100)
+    assert join_waitlist(db, 4, 1)[0]  # #2 Zhanibek ($100)
+    bid = booking_id_of(db, 2, 1)      # Iskander's Yoga ($15)
+    ok, msg = cancel_booking(db, 2, bid)
+    assert ok and "auto-promoted" in msg.lower() and "adil" in msg.lower(), msg
+    assert taken_of(db, 1) == 2
+    assert balance_of(db, 2) == 100.0  # Iskander refunded $15 (85 -> 100)
+    assert balance_of(db, 3) == 85.0   # Adil charged $15 (100 -> 85)
+    assert balance_of(db, 4) == 100.0  # Zhanibek still waiting
+    assert get_member_waitlist(db, 3) == []
+    wl4 = get_member_waitlist(db, 4)
+    assert len(wl4) == 1 and wl4[0]["position"] == 1
+
+
+@case(G_WAITLIST)
+def waitlist_auto_promote_skips_low_balance_and_expired():
+    """Auto-promotion skips low-balance and expired members (keeping them queued) and promotes next eligible"""
+    db = fresh_db()
+    # Add extra active member who will be #3
+    assert register_member(db, "Eligible User", "elig@kbtu.kz", "1234")[0]
+    m_elig = db.execute("SELECT member_id FROM Members WHERE email='elig@kbtu.kz'").fetchone()[0]
+    assert join_waitlist(db, 3, 1)[0]       # #1 Adil -> will lower balance below $15
+    assert join_waitlist(db, 4, 1)[0]       # #2 Zhanibek -> will expire membership
+    assert join_waitlist(db, m_elig, 1)[0]  # #3 Eligible ($100, active)
+    with db:
+        db.execute("UPDATE Members SET balance=5.0 WHERE member_id=3")
+        db.execute("UPDATE Members SET membership_status='expired' WHERE member_id=4")
+    ok, msg = cancel_booking(db, 2, booking_id_of(db, 2, 1))
+    assert ok and "eligible user" in msg.lower(), msg
+    assert balance_of(db, 3) == 5.0
+    assert balance_of(db, 4) == 100.0
+    assert balance_of(db, m_elig) == 85.0
+    assert taken_of(db, 1) == 2
+    # Skipped members remain in waitlist queue
+    assert len(get_member_waitlist(db, 3)) == 1
+    assert len(get_member_waitlist(db, 4)) == 1
+    assert get_member_waitlist(db, m_elig) == []
+
+
+@case(G_WAITLIST)
+def waitlist_delete_session_cascades_entries():
+    """Deleting a session removes all its waitlist entries transactionally"""
+    db = fresh_db()
+    assert join_waitlist(db, 3, 1)[0]
+    assert join_waitlist(db, 4, 1)[0]
+    assert delete_session(db, 1)[0]
+    assert db.execute("SELECT COUNT(*) FROM Waitlist WHERE session_id=1").fetchone()[0] == 0
+
+
+@case(G_WAITLIST)
+def waitlist_capacity_increase_auto_promotes():
+    """Increasing capacity of a full upcoming session auto-promotes eligible waitlisted members"""
+    db = fresh_db()
+    assert join_waitlist(db, 3, 1)[0]
+    assert join_waitlist(db, 4, 1)[0]
+    ok, msg = update_session(db, 1, "Yoga", "Aigerim", day(1), "10:00", 3, 15.0)
+    assert ok and "adil" in msg.lower(), msg
+    assert taken_of(db, 1) == 3
+    assert balance_of(db, 3) == 85.0
+    assert get_member_waitlist(db, 3) == []
+    assert len(get_member_waitlist(db, 4)) == 1
+
+
+# ---------- CONCURRENCY: 15 multithreaded race-condition tests ----------
+def _make_temp_db(temp_dir):
+    db_path = os.path.join(temp_dir, "conc_test.db")
+    with closing(connect_db(db_path)) as conn:
+        seed_db(conn, extended=False)
+    return db_path
+
+
+def _add_test_member(conn, idx, balance=100.0, status="active"):
+    cur = conn.execute(
+        "INSERT INTO Members(name,email,membership_status,password_hash,role,balance) "
+        "VALUES (?,?,?,?,?,?)",
+        (f"Worker {idx}", f"worker{idx}@kbtu.kz", status, DEMO_PW_HASH, "member", balance))
+    return cur.lastrowid
+
+
+def _add_test_session(conn, title, capacity, price=15.0, days_ahead=5):
+    cur = conn.execute(
+        "INSERT INTO Sessions(title,trainer,session_date,start_time,capacity,price) "
+        "VALUES (?,?,?,?,?,?)",
+        (title, "Coach", day(days_ahead), "12:00", capacity, price))
+    return cur.lastrowid
+
+
+def _run_concurrent(tasks):
+    """Run callables concurrently using a Barrier so every thread collides simultaneously."""
+    barrier = threading.Barrier(len(tasks))
+    results = [None] * len(tasks)
+    errors = []
+    err_lock = threading.Lock()
+
+    def runner(i, fn):
+        try:
+            results[i] = fn(barrier)
+        except Exception as exc:
+            with err_lock:
+                errors.append((i, type(exc).__name__, str(exc)))
+
+    threads = [threading.Thread(target=runner, args=(i, fn)) for i, fn in enumerate(tasks)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"Thread errors: {errors}"
+    return results
+
+
+@case(G_CONCURRENCY)
+def conc_01_last_seat_race():
+    """10 threads book capacity=1 simultaneously -> strictly 1 succeeds, 1 payment deducted"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                mids = [_add_test_member(db, i, 100.0) for i in range(10)]
+                sid = _add_test_session(db, "Last Seat", 1, 15.0)
+
+        def worker(mid):
+            def run(barrier):
+                with closing(connect_db(db_path)) as conn:
+                    barrier.wait()
+                    return book_session(conn, mid, sid)
+            return run
+
+        res = _run_concurrent([worker(m) for m in mids])
+        assert sum(1 for ok, _ in res if ok) == 1, res
+        assert sum(1 for ok, _ in res if not ok) == 9, res
+        with closing(connect_db(db_path)) as db:
+            assert taken_of(db, sid) == 1
+            assert db.execute("SELECT COUNT(*) FROM Payments WHERE session_id=? AND status='paid'",
+                              (sid,)).fetchone()[0] == 1
+            bals = [balance_of(db, m) for m in mids]
+            assert bals.count(85.0) == 1 and bals.count(100.0) == 9, bals
+
+
+@case(G_CONCURRENCY)
+def conc_02_multi_seat_exact_capacity_race():
+    """12 threads book capacity=3 simultaneously -> strictly 3 succeed, 3 payments deducted"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                mids = [_add_test_member(db, i, 100.0) for i in range(12)]
+                sid = _add_test_session(db, "Three Seats", 3, 20.0)
+
+        def worker(mid):
+            def run(barrier):
+                with closing(connect_db(db_path)) as conn:
+                    barrier.wait()
+                    return book_session(conn, mid, sid)
+            return run
+
+        res = _run_concurrent([worker(m) for m in mids])
+        assert sum(1 for ok, _ in res if ok) == 3, res
+        assert sum(1 for ok, _ in res if not ok) == 9, res
+        with closing(connect_db(db_path)) as db:
+            assert taken_of(db, sid) == 3
+            assert db.execute("SELECT COUNT(*) FROM Payments WHERE session_id=? AND status='paid'",
+                              (sid,)).fetchone()[0] == 3
+
+
+@case(G_CONCURRENCY)
+def conc_03_same_user_double_book_race():
+    """1 member sends 5 concurrent bookings for the same session -> 1 booking, 1 charge"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                sid = _add_test_session(db, "Single User Race", 5, 20.0)
+
+        def run(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return book_session(conn, 3, sid)
+
+        res = _run_concurrent([run for _ in range(5)])
+        assert sum(1 for ok, _ in res if ok) == 1, res
+        with closing(connect_db(db_path)) as db:
+            assert taken_of(db, sid) == 1
+            assert balance_of(db, 3) == 80.0
+            assert db.execute("SELECT COUNT(*) FROM Payments WHERE member_id=3 AND session_id=?",
+                              (sid,)).fetchone()[0] == 1
+
+
+@case(G_CONCURRENCY)
+def conc_04_double_cancel_double_refund_race():
+    """5 threads cancel the same booking_id -> strictly 1 succeeds, 1 refund"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            assert book_session(db, 3, 2)[0]  # Boxing $20 -> balance $80
+            bid = booking_id_of(db, 3, 2)
+
+        def run(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return cancel_booking(conn, 3, bid)
+
+        res = _run_concurrent([run for _ in range(5)])
+        assert sum(1 for ok, _ in res if ok) == 1, res
+        assert sum(1 for ok, _ in res if not ok) == 4, res
+        with closing(connect_db(db_path)) as db:
+            assert taken_of(db, 2) == 0
+            assert balance_of(db, 3) == 100.0
+            assert db.execute("SELECT COUNT(*) FROM Payments WHERE member_id=3 AND status='refunded'").fetchone()[0] == 1
+
+
+@case(G_CONCURRENCY)
+def conc_05_insufficient_balance_multi_session_race():
+    """Member with $10 concurrently books 3 different $10 sessions -> strictly 1 succeeds, balance >= 0"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                db.execute("UPDATE Members SET balance=10.0 WHERE member_id=3")
+                sids = [_add_test_session(db, f"Budget {i}", 5, 10.0) for i in range(3)]
+
+        def worker(sid):
+            def run(barrier):
+                with closing(connect_db(db_path)) as conn:
+                    barrier.wait()
+                    return book_session(conn, 3, sid)
+            return run
+
+        res = _run_concurrent([worker(s) for s in sids])
+        assert sum(1 for ok, _ in res if ok) == 1, res
+        assert sum(1 for ok, _ in res if not ok) == 2, res
+        with closing(connect_db(db_path)) as db:
+            assert balance_of(db, 3) == 0.0
+            assert db.execute("SELECT COUNT(*) FROM Bookings WHERE member_id=3").fetchone()[0] == 1
+
+
+@case(G_CONCURRENCY)
+def conc_06_concurrent_topup_no_lost_updates():
+    """10 threads simultaneously top up +$10 -> balance increases by exact $100"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+
+        def run(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return topup_balance(conn, 3, 10.0)
+
+        res = _run_concurrent([run for _ in range(10)])
+        assert all(ok for ok, _ in res), res
+        with closing(connect_db(db_path)) as db:
+            assert balance_of(db, 3) == 200.0
+
+
+@case(G_CONCURRENCY)
+def conc_07_waitlist_join_same_user_race():
+    """5 threads for same member join waitlist of full session -> strictly 1 row"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+
+        def run(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return join_waitlist(conn, 3, 1)  # Yoga (full)
+
+        res = _run_concurrent([run for _ in range(5)])
+        assert sum(1 for ok, _ in res if ok) == 1, res
+        assert sum(1 for ok, _ in res if not ok) == 4, res
+        with closing(connect_db(db_path)) as db:
+            assert db.execute("SELECT COUNT(*) FROM Waitlist WHERE member_id=3 AND session_id=1").fetchone()[0] == 1
+
+
+@case(G_CONCURRENCY)
+def conc_08_waitlist_join_multiple_users_fifo():
+    """8 members simultaneously join full session's waitlist -> all 8 inserted with unique sequential order"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                mids = [_add_test_member(db, i, 100.0) for i in range(8)]
+
+        def worker(mid):
+            def run(barrier):
+                with closing(connect_db(db_path)) as conn:
+                    barrier.wait()
+                    return join_waitlist(conn, mid, 1)
+            return run
+
+        res = _run_concurrent([worker(m) for m in mids])
+        assert all(ok for ok, _ in res), res
+        with closing(connect_db(db_path)) as db:
+            rows = db.execute(
+                "SELECT waitlist_id, member_id FROM Waitlist WHERE session_id=1 "
+                "ORDER BY created_at ASC, waitlist_id ASC").fetchall()
+            assert len(rows) == 8
+            assert len({r["member_id"] for r in rows}) == 8
+            wids = [r["waitlist_id"] for r in rows]
+            assert wids == sorted(wids) and len(set(wids)) == 8
+
+
+@case(G_CONCURRENCY)
+def conc_09_concurrent_cancel_and_fifo_auto_promote():
+    """2 booked users cancel simultaneously with 4 waitlisted -> first 2 promoted FIFO, charged, others refunded"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                sid = _add_test_session(db, "Promo Class", 2, 15.0)
+                a = _add_test_member(db, 1, 100.0)
+                b = _add_test_member(db, 2, 100.0)
+                w = [_add_test_member(db, i, 100.0) for i in range(3, 7)]
+            assert book_session(db, a, sid)[0]
+            assert book_session(db, b, sid)[0]
+            ba, bb = booking_id_of(db, a, sid), booking_id_of(db, b, sid)
+            for wm in w:
+                assert join_waitlist(db, wm, sid)[0]
+
+        def cancel_task(mid, bid):
+            def run(barrier):
+                with closing(connect_db(db_path)) as conn:
+                    barrier.wait()
+                    return cancel_booking(conn, mid, bid)
+            return run
+
+        res = _run_concurrent([cancel_task(a, ba), cancel_task(b, bb)])
+        assert all(ok for ok, _ in res), res
+        with closing(connect_db(db_path)) as db:
+            assert taken_of(db, sid) == 2
+            booked = {r[0] for r in db.execute(
+                "SELECT member_id FROM Bookings WHERE session_id=? AND status='confirmed'", (sid,))}
+            assert booked == {w[0], w[1]}, booked
+            remaining = [r[0] for r in db.execute(
+                "SELECT member_id FROM Waitlist WHERE session_id=? ORDER BY created_at ASC, waitlist_id ASC", (sid,))]
+            assert remaining == [w[2], w[3]], remaining
+            assert balance_of(db, a) == 100.0 and balance_of(db, b) == 100.0
+            assert balance_of(db, w[0]) == 85.0 and balance_of(db, w[1]) == 85.0
+            assert balance_of(db, w[2]) == 100.0 and balance_of(db, w[3]) == 100.0
+
+
+@case(G_CONCURRENCY)
+def conc_10_cancel_vs_direct_booking_with_waitlist():
+    """Cancel vs direct booking while user is waitlisted -> capacity never exceeded, balances consistent"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                sid = _add_test_session(db, "Contested Spot", 1, 15.0)
+                owner = _add_test_member(db, 1, 100.0)
+                waiter = _add_test_member(db, 2, 100.0)
+                outsider = _add_test_member(db, 3, 100.0)
+            assert book_session(db, owner, sid)[0]
+            bid = booking_id_of(db, owner, sid)
+            assert join_waitlist(db, waiter, sid)[0]
+
+        def do_cancel(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return cancel_booking(conn, owner, bid)
+
+        def do_book(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return book_session(conn, outsider, sid)
+
+        res = _run_concurrent([do_cancel, do_book])
+        assert res[0][0] is True, res
+        with closing(connect_db(db_path)) as db:
+            assert taken_of(db, sid) == 1
+            # Atomic auto-promotion inside cancel_booking ensures waiter gets the spot and outsider cannot overbook
+            assert res[1][0] is False, res
+            assert balance_of(db, owner) == 100.0
+            assert balance_of(db, waiter) == 85.0
+            assert balance_of(db, outsider) == 100.0
+            assert db.execute("SELECT COUNT(*) FROM Waitlist WHERE session_id=?", (sid,)).fetchone()[0] == 0
+
+
+@case(G_CONCURRENCY)
+def conc_11_waitlist_leave_vs_cancel_auto_promote():
+    """Waitlisted #1 leaves at exact moment of cancellation -> no crash, no double-book, consistent state"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                sid = _add_test_session(db, "Leave vs Promote", 1, 15.0)
+                owner = _add_test_member(db, 1, 100.0)
+                w1 = _add_test_member(db, 2, 100.0)
+                w2 = _add_test_member(db, 3, 100.0)
+            assert book_session(db, owner, sid)[0]
+            bid = booking_id_of(db, owner, sid)
+            assert join_waitlist(db, w1, sid)[0]
+            assert join_waitlist(db, w2, sid)[0]
+
+        def do_leave(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return leave_waitlist(conn, w1, sid)
+
+        def do_cancel(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return cancel_booking(conn, owner, bid)
+
+        res = _run_concurrent([do_leave, do_cancel])
+        assert res[1][0] is True, res
+        with closing(connect_db(db_path)) as db:
+            assert taken_of(db, sid) == 1
+            assert balance_of(db, owner) == 100.0
+            booked_id = db.execute("SELECT member_id FROM Bookings WHERE session_id=?", (sid,)).fetchone()[0]
+            assert booked_id in (w1, w2)
+            # No member is both booked and on waitlist
+            overlap = db.execute("""
+                SELECT COUNT(*) FROM Bookings b
+                JOIN Waitlist w ON b.member_id=w.member_id AND b.session_id=w.session_id
+                WHERE b.session_id=?""", (sid,)).fetchone()[0]
+            assert overlap == 0
+            # Winner charged $15, other unchanged, no negative balances
+            other = w2 if booked_id == w1 else w1
+            assert balance_of(db, booked_id) == 85.0
+            assert balance_of(db, other) == 100.0
+
+
+@case(G_CONCURRENCY)
+def conc_12_admin_capacity_reduction_vs_booking():
+    """Admin reduces capacity while 5 users book concurrently -> taken <= capacity invariant always holds"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        d5 = day(5)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                sid = _add_test_session(db, "Shrink Hall", 5, 10.0, days_ahead=5)
+                init_m = _add_test_member(db, 0, 100.0)
+                mids = [_add_test_member(db, i, 100.0) for i in range(1, 6)]
+            assert book_session(db, init_m, sid)[0]
+
+        def do_reduce(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return update_session(conn, sid, "Shrink Hall", "Coach", d5, "12:00", 2, 10.0)
+
+        def do_book(mid):
+            def run(barrier):
+                with closing(connect_db(db_path)) as conn:
+                    barrier.wait()
+                    return book_session(conn, mid, sid)
+            return run
+
+        res = _run_concurrent([do_reduce] + [do_book(m) for m in mids])
+        admin_ok = res[0][0]
+        book_ok_count = sum(1 for ok, _ in res[1:] if ok)
+        with closing(connect_db(db_path)) as db:
+            cap = db.execute("SELECT capacity FROM Sessions WHERE session_id=?", (sid,)).fetchone()[0]
+            taken = taken_of(db, sid)
+            assert taken <= cap, f"Invariant violated: taken={taken} > cap={cap}"
+            assert taken == 1 + book_ok_count
+            if admin_ok:
+                assert cap == 2 and taken <= 2
+            else:
+                assert cap == 5 and taken > 2
+
+
+@case(G_CONCURRENCY)
+def conc_13_failed_login_bruteforce_lockout():
+    """8 threads submit wrong passwords simultaneously -> reliable increment & lockout without lost updates"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+
+        def run(barrier):
+            with closing(connect_db(db_path)) as conn:
+                barrier.wait()
+                return authenticate_with_status(conn, "adil@kbtu.kz", "wrongpw")
+
+        res = _run_concurrent([run for _ in range(8)])
+        assert all(m is None for m, _ in res)
+        assert any("locked" in (err or "").lower() for _, err in res), res
+        with closing(connect_db(db_path)) as db:
+            row = db.execute("SELECT failed_attempts, locked_until FROM Members WHERE member_id=3").fetchone()
+            assert row["failed_attempts"] == MAX_LOGIN_ATTEMPTS, dict(row)
+            assert row["locked_until"] is not None and datetime.fromisoformat(row["locked_until"]) > datetime.now()
+            m_ok, err_ok = authenticate_with_status(db, "adil@kbtu.kz", "1234")
+            assert m_ok is None and "locked" in (err_ok or "").lower()
+
+
+@case(G_CONCURRENCY)
+def conc_14_password_reset_token_single_use_race():
+    """5 threads submit the same valid reset token simultaneously -> strictly 1 succeeds, 4 fail"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            ok, token, _ = create_password_reset(db, "adil@kbtu.kz")
+            assert ok and token
+
+        def worker(idx):
+            def run(barrier):
+                with closing(connect_db(db_path)) as conn:
+                    barrier.wait()
+                    return reset_password_with_token(conn, token, f"newpass{idx}")
+            return run
+
+        res = _run_concurrent([worker(i) for i in range(5)])
+        winners = [i for i, (ok, _) in enumerate(res) if ok]
+        assert len(winners) == 1, res
+        assert sum(1 for ok, _ in res if not ok) == 4, res
+        with closing(connect_db(db_path)) as db:
+            used = db.execute("SELECT used FROM PasswordResets WHERE token=?", (token,)).fetchone()[0]
+            assert used == 1
+            assert authenticate(db, "adil@kbtu.kz", f"newpass{winners[0]}") is not None
+
+
+@case(G_CONCURRENCY)
+def conc_15_waitlist_promote_skips_ineligible_under_concurrency():
+    """Concurrent cancels skip low-balance/expired waitlisted users and cleanly promote eligible ones"""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = _make_temp_db(td)
+        with closing(connect_db(db_path)) as db:
+            with db:
+                sid = _add_test_session(db, "Eligibility Race", 2, 20.0)
+                a = _add_test_member(db, 1, 100.0)
+                b = _add_test_member(db, 2, 100.0)
+                w_poor = _add_test_member(db, 3, 5.0, "active")
+                w_exp = _add_test_member(db, 4, 100.0, "active")
+                w_ok1 = _add_test_member(db, 5, 100.0, "active")
+                w_ok2 = _add_test_member(db, 6, 100.0, "active")
+            assert book_session(db, a, sid)[0]
+            assert book_session(db, b, sid)[0]
+            ba, bb = booking_id_of(db, a, sid), booking_id_of(db, b, sid)
+            for wm in (w_poor, w_exp, w_ok1, w_ok2):
+                assert join_waitlist(db, wm, sid)[0]
+            # Expire w_exp after joining waitlist
+            with db:
+                db.execute("UPDATE Members SET membership_status='expired' WHERE member_id=?", (w_exp,))
+
+        def cancel_task(mid, bid):
+            def run(barrier):
+                with closing(connect_db(db_path)) as conn:
+                    barrier.wait()
+                    return cancel_booking(conn, mid, bid)
+            return run
+
+        res = _run_concurrent([cancel_task(a, ba), cancel_task(b, bb)])
+        assert all(ok for ok, _ in res), res
+        with closing(connect_db(db_path)) as db:
+            assert taken_of(db, sid) == 2
+            booked = {r[0] for r in db.execute(
+                "SELECT member_id FROM Bookings WHERE session_id=? AND status='confirmed'", (sid,))}
+            assert booked == {w_ok1, w_ok2}, booked
+            assert balance_of(db, w_poor) == 5.0
+            assert balance_of(db, w_exp) == 100.0
+            assert balance_of(db, w_ok1) == 80.0
+            assert balance_of(db, w_ok2) == 80.0
+            assert balance_of(db, a) == 100.0 and balance_of(db, b) == 100.0
+            rem = [r[0] for r in db.execute(
+                "SELECT member_id FROM Waitlist WHERE session_id=? ORDER BY created_at ASC, waitlist_id ASC", (sid,))]
+            assert rem == [w_poor, w_exp], rem
+
+
 def run_all_tests():
     groups = {}
     for group, f in TESTS:
@@ -2287,33 +3238,53 @@ PAGE = HEAD + NAV + OCCUPANCY_WIDGET + """
     <button>Search</button>
   </span>
 </form>
-<form method="post" action="{{ url_for('book') }}">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <h2>Sessions</h2>
-  <table>
-    <tr><th>Title</th><th>Trainer</th><th>Date &amp; Time</th><th>Price</th><th>Occupancy &amp; Places</th><th></th></tr>
-    {% for s in sessions %}
-    <tr class="{{ 'full' if s.taken >= s.capacity }} {{ 'past' if s.is_past }}">
-      <td>{{ s.title }}
-        {% if s.session_id in booked_ids %}<span class="badge">&#10003; Booked</span>{% endif %}
-        {% if s.is_past %}<span class="badge grey">past</span>{% endif %}</td>
-      <td>{{ s.trainer }}</td>
-      <td>{{ s.session_date }} {{ s.start_time }}</td>
-      <td><b>${{ "%.2f"|format(s.price) }}</b></td>
-      <td>
-        <span class="progress-track sm"><span class="progress-fill fill-{{ s.load_level }}" style="display:block;width:{{ s.occupancy_pct }}%"></span></span>
-        <span class="badge {{ 'red' if s.load_level == 'high' else ('amber' if s.load_level == 'medium' else '') }}">{{ s.load_label }} ({{ s.occupancy_pct }}%)</span>
-        <div style="font-size:12px;margin-top:2px" class="{{ 'low-spots' if s.capacity - s.taken <= 1 }}">
-          {{ s.capacity - s.taken }} left ({{ s.taken }} / {{ s.capacity }})
-        </div>
-      </td>
-      <td><button name="session_id" value="{{ s.session_id }}">Book</button></td>
-    </tr>
-    {% else %}
-    <tr><td colspan="6">No sessions found.</td></tr>
-    {% endfor %}
-  </table>
-</form>
+<h2>Sessions</h2>
+<table>
+  <tr><th>Title</th><th>Trainer</th><th>Date &amp; Time</th><th>Price</th><th>Occupancy &amp; Places</th><th></th></tr>
+  {% for s in sessions %}
+  <tr class="{{ 'full' if s.taken >= s.capacity }} {{ 'past' if s.is_past }}">
+    <td>{{ s.title }}
+      {% if s.session_id in booked_ids %}<span class="badge">&#10003; Booked</span>{% endif %}
+      {% if s.session_id in waitlist_positions %}<span class="badge amber">Waitlist #{{ waitlist_positions[s.session_id] }}</span>{% endif %}
+      {% if s.is_past %}<span class="badge grey">past</span>{% endif %}</td>
+    <td>{{ s.trainer }}</td>
+    <td>{{ s.session_date }} {{ s.start_time }}</td>
+    <td><b>${{ "%.2f"|format(s.price) }}</b></td>
+    <td>
+      <span class="progress-track sm"><span class="progress-fill fill-{{ s.load_level }}" style="display:block;width:{{ s.occupancy_pct }}%"></span></span>
+      <span class="badge {{ 'red' if s.load_level == 'high' else ('amber' if s.load_level == 'medium' else '') }}">{{ s.load_label }} ({{ s.occupancy_pct }}%)</span>
+      {% if s.waitlist_count > 0 %}<span class="badge blue">Waitlist: {{ s.waitlist_count }}</span>{% endif %}
+      <div style="font-size:12px;margin-top:2px" class="{{ 'low-spots' if s.capacity - s.taken <= 1 }}">
+        {{ s.capacity - s.taken }} left ({{ s.taken }} / {{ s.capacity }})
+      </div>
+    </td>
+    <td style="white-space:nowrap">
+      {% if not s.is_past and s.taken >= s.capacity and s.session_id not in booked_ids %}
+        {% if s.session_id in waitlist_positions %}
+        <form method="post" action="{{ url_for('waitlist_leave') }}" style="margin:0">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="session_id" value="{{ s.session_id }}">
+          <button class="secondary">Leave Waitlist (#{{ waitlist_positions[s.session_id] }})</button>
+        </form>
+        {% else %}
+        <form method="post" action="{{ url_for('waitlist_join') }}" style="margin:0">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="session_id" value="{{ s.session_id }}">
+          <button class="secondary">Join Waitlist</button>
+        </form>
+        {% endif %}
+      {% else %}
+      <form method="post" action="{{ url_for('book') }}" style="margin:0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button name="session_id" value="{{ s.session_id }}">Book</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6">No sessions found.</td></tr>
+  {% endfor %}
+</table>
 <h2>My bookings</h2>
 <table>
   <tr><th>Session</th><th>Trainer</th><th>Date</th><th>Time</th><th>Price</th><th>Booked at</th><th></th></tr>
@@ -2334,6 +3305,29 @@ PAGE = HEAD + NAV + OCCUPANCY_WIDGET + """
   </tr>
   {% else %}
   <tr><td colspan="7">You have no bookings yet.</td></tr>
+  {% endfor %}
+</table>
+<h2>My Waitlist</h2>
+<table>
+  <tr><th>Session</th><th>Trainer</th><th>Date &amp; Time</th><th>Price</th><th>Position</th><th>Joined at</th><th></th></tr>
+  {% for w in my_waitlist %}
+  <tr class="{{ 'past' if w.is_past }}">
+    <td>{{ w.title }}</td>
+    <td>{{ w.trainer }}</td>
+    <td class="mono">{{ w.session_date }} {{ w.start_time }}</td>
+    <td>${{ "%.2f"|format(w.price) }}</td>
+    <td><span class="badge amber">#{{ w.position }}</span></td>
+    <td class="mono">{{ w.created_at }}</td>
+    <td>
+      <form method="post" action="{{ url_for('waitlist_leave') }}" style="margin:0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="session_id" value="{{ w.session_id }}">
+        <button class="secondary">Leave Waitlist</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7" class="empty">You are not on any waitlists.</td></tr>
   {% endfor %}
 </table>
 <h2>My Payments &amp; Refunds</h2>
@@ -2470,7 +3464,7 @@ ADMIN_PAGE = HEAD + NAV + OCCUPANCY_WIDGET + """
     <td><input form="f{{ s.session_id }}" type="time" name="start_time" value="{{ s.start_time }}"></td>
     <td><input form="f{{ s.session_id }}" type="number" min="1" name="capacity" value="{{ s.capacity }}" style="width:60px"></td>
     <td><input form="f{{ s.session_id }}" type="number" step="0.01" min="0" name="price" value="{{ '%.2f'|format(s.price) }}" style="width:74px"></td>
-    <td style="white-space:nowrap">{{ s.taken }}/{{ s.capacity }} <span class="badge {{ 'red' if s.load_level == 'high' else ('amber' if s.load_level == 'medium' else '') }}">{{ s.occupancy_pct }}%</span></td>
+    <td style="white-space:nowrap">{{ s.taken }}/{{ s.capacity }} <span class="badge {{ 'red' if s.load_level == 'high' else ('amber' if s.load_level == 'medium' else '') }}">{{ s.occupancy_pct }}%</span>{% if s.waitlist_count > 0 %} <span class="badge blue">WL: {{ s.waitlist_count }}</span>{% endif %}</td>
     <td style="white-space:nowrap">
       <form id="f{{ s.session_id }}" method="post" style="display:none">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -2525,6 +3519,33 @@ ADMIN_PAGE = HEAD + NAV + OCCUPANCY_WIDGET + """
             <button class="danger">Cancel &amp; Refund</button></form></td></tr>
   {% endfor %}
 </table>
+
+<h2>Waitlist Queue</h2>
+<div class="table-wrap"><table>
+  <tr><th>Session</th><th>Date &amp; Time</th><th>Pos</th><th>Member</th><th>Status</th><th>Balance</th><th>Joined at</th><th></th></tr>
+  {% for w in waitlist_entries %}
+  <tr>
+    <td>{{ w.session_title }}</td>
+    <td class="mono">{{ w.session_date }} {{ w.start_time }}</td>
+    <td><span class="badge amber">#{{ w.position }}</span></td>
+    <td>{{ w.member_name }} <span class="muted">({{ w.member_email }})</span></td>
+    <td><span class="badge {{ '' if w.membership_status == 'active' else 'red' }}">{{ w.membership_status }}</span></td>
+    <td class="mono">${{ "%.2f"|format(w.balance) }}</td>
+    <td class="mono">{{ w.created_at }}</td>
+    <td>
+      <form method="post" action="{{ url_for('waitlist_leave') }}" style="margin:0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="session_id" value="{{ w.session_id }}">
+        <input type="hidden" name="member_id" value="{{ w.member_id }}">
+        <input type="hidden" name="next" value="admin">
+        <button class="danger">Remove</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="8" class="empty">No members currently on any waitlist.</td></tr>
+  {% endfor %}
+</table></div>
 
 <h2>Recent Payments &amp; Refunds</h2>
 <table>
@@ -2625,7 +3646,7 @@ AUDIT_PAGE = HEAD + NAV + """
 
 TESTS_PAGE = HEAD + NAV + """
 <h2>Tests: {{ passed }} / {{ total }} passed</h2>
-<p>Every test runs on a temporary in-memory database; the real <code>gym.db</code> is not changed.</p>
+<p>Every test runs on an isolated temporary database (in-memory or temp file); the real <code>gym.db</code> is never changed.</p>
 {% for grp in groups %}
 <h3>{{ grp.title }} ({{ grp.passed }} / {{ grp.results|length }})</h3>
 <table>
@@ -2726,14 +3747,41 @@ def index():
     upcoming = True if first_visit else request.args.get("upcoming") == "1"
     sessions = search_sessions(db, q, upcoming)
     my_bookings = get_member_bookings(db, user["member_id"])
+    my_waitlist = get_member_waitlist(db, user["member_id"])
     my_payments = get_member_payments(db, user["member_id"])
     occupancy = get_gym_occupancy(db)
     return render_template_string(
         PAGE, title="Sessions", user=user, q=q, upcoming=upcoming, sessions=sessions,
-        my_bookings=my_bookings, my_payments=my_payments, occupancy=occupancy,
+        my_bookings=my_bookings, my_waitlist=my_waitlist,
+        waitlist_positions={w["session_id"]: w["position"] for w in my_waitlist},
+        my_payments=my_payments, occupancy=occupancy,
         booked_ids={b["session_id"] for b in my_bookings},
         upcoming_count=sum(1 for b in my_bookings if not b["is_past"]),
         club_load=get_club_load(db))  # ADDED (Iskander)
+
+
+@app.post("/waitlist/join")
+@login_required
+def waitlist_join():
+    user = current_user()
+    session_id = request.form.get("session_id", type=int)
+    ok, msg = join_waitlist(get_db(), user["member_id"], session_id)
+    flash(msg, "ok" if ok else "err")
+    return redirect(url_for("index"))
+
+
+@app.post("/waitlist/leave")
+@login_required
+def waitlist_leave():
+    user = current_user()
+    is_admin = user["role"] == "admin"
+    session_id = request.form.get("session_id", type=int)
+    target_member_id = request.form.get("member_id", type=int)
+    ok, msg = leave_waitlist_audited(get_db(), user, session_id, target_member_id, is_admin)
+    flash(msg, "ok" if ok else "err")
+    if is_admin and request.form.get("next") == "admin":
+        return redirect(url_for("admin"))
+    return redirect(url_for("index"))
 
 
 @app.post("/topup")
@@ -2781,6 +3829,7 @@ def admin():
     return render_template_string(
         ADMIN_PAGE, title="Admin", user=current_user(),
         sessions=search_sessions(db), bookings=bookings,
+        waitlist_entries=get_all_waitlist_entries(db),
         members=get_all_members(db), occupancy=get_gym_occupancy(db),
         club_load=get_club_load(db), recent_audit=get_audit_log(db, limit=5), audit_actions=AUDIT_ACTIONS,  # ADDED (Iskander)
         pay_summary=pay_summary, recent_payments=recent_payments)
